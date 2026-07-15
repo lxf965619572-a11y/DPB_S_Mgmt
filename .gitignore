@@ -18,6 +18,9 @@ reports/
 *.gz
 *.rar
 
+# 版本备份目录
+20260521/
+
 # IDE 配置（可选，如果想保留 VSCode 配置可以注释掉）
 # .vscode/
 
