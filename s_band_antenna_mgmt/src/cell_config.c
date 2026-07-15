@@ -222,6 +222,76 @@ int cell_config_apply_cell(const cell_config_ie_t *cell_cfg, uint32_t *result)
     return SUCCESS;
 }
 
+/**
+ * 等待并验证天线工作模式切换
+ * 发送频点配置后，天线会从业务模式切到其他模式（如待机或校准），然后再切回业务模式
+ *
+ * 返回值：
+ *   SUCCESS - 检测到模式从业务模式变化，再回到业务模式
+ *   ERROR_TIMEOUT - 超时未检测到预期的模式切换
+ *   ERROR_GENERAL - 其他错误
+ */
+static int wait_for_antenna_mode_cycle(void)
+{
+    const int MAX_WAIT_MS = 5000;       /* 最大等待时间：5秒 */
+    const int POLL_INTERVAL_MS = 100;   /* 轮询间隔：100ms */
+    int elapsed_ms = 0;
+
+    bool mode_changed = false;          /* 是否检测到模式变化 */
+    uint32_t initial_mode = PHASED_ARRAY_MODE_BUSINESS;
+
+    LOG_INFO("Waiting for antenna work mode to cycle (business -> other -> business)...");
+
+    /* 第一阶段：等待模式从业务模式切换到其他模式 */
+    while (elapsed_ms < MAX_WAIT_MS && !mode_changed) {
+        fpga_status_frame_t fpga_status;
+        if (fpga_handler_get_status(&fpga_status) == SUCCESS) {
+            uint32_t current_mode = fpga_status.data.phased_array_work_mode;
+
+            if (current_mode != PHASED_ARRAY_MODE_BUSINESS) {
+                LOG_INFO("Antenna mode changed from business to mode %u", current_mode);
+                mode_changed = true;
+                break;
+            }
+        }
+
+        usleep(POLL_INTERVAL_MS * 1000);
+        elapsed_ms += POLL_INTERVAL_MS;
+    }
+
+    if (!mode_changed) {
+        LOG_WARN("Antenna mode did not change from business mode within %d ms", MAX_WAIT_MS);
+        /* 可能天线已经配置好了，不算错误 */
+        return SUCCESS;
+    }
+
+    /* 第二阶段：等待模式切回业务模式 */
+    bool mode_back_to_business = false;
+    while (elapsed_ms < MAX_WAIT_MS) {
+        fpga_status_frame_t fpga_status;
+        if (fpga_handler_get_status(&fpga_status) == SUCCESS) {
+            uint32_t current_mode = fpga_status.data.phased_array_work_mode;
+
+            if (current_mode == PHASED_ARRAY_MODE_BUSINESS) {
+                LOG_INFO("Antenna mode returned to business mode (cycle completed)");
+                mode_back_to_business = true;
+                break;
+            }
+        }
+
+        usleep(POLL_INTERVAL_MS * 1000);
+        elapsed_ms += POLL_INTERVAL_MS;
+    }
+
+    if (!mode_back_to_business) {
+        LOG_ERROR("Antenna mode did not return to business mode within %d ms", MAX_WAIT_MS);
+        return ERROR_TIMEOUT;
+    }
+
+    LOG_INFO("Antenna work mode cycle verification completed successfully (took %d ms)", elapsed_ms);
+    return SUCCESS;
+}
+
 /* 应用频点配置 */
 int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
 {
@@ -298,7 +368,7 @@ int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
                      freq_cfg->local_cell_id, freq_cfg->beam_id,
                      freq_cfg->dl_center_freq, freq_cfg->ul_center_freq, freq_cfg->beam_bandwidth);
 
-            /* 发送频率与带宽配置到FPGA */
+            /* 发送频率与带宽配置到FPGA/天线 */
             int ret = fpga_send_freq_band(freq_cfg->dl_center_freq,
                                           freq_cfg->ul_center_freq,
                                           freq_cfg->beam_bandwidth);
@@ -306,13 +376,31 @@ int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
                 LOG_ERROR("Failed to send freq/band to FPGA");
                 *result = CONFIG_RESULT_FAILURE;
             } else {
-                LOG_INFO("Sent freq/band to FPGA: DL=%u kHz, UL=%u kHz, BW=%u",
+                LOG_INFO("Sent freq/band to antenna: DL=%u kHz, UL=%u kHz, BW=%u",
                          freq_cfg->dl_center_freq, freq_cfg->ul_center_freq, freq_cfg->beam_bandwidth);
-                *result = CONFIG_RESULT_SUCCESS;
-            }
 
-            /* 检查全局频点状态并更新发射控制 */
-            update_tx_control();
+                /* 释放锁以允许状态更新 */
+                pthread_mutex_unlock(&g_cell_mgr.mutex);
+
+                /* 等待并验证天线工作模式切换（业务模式 -> 其他模式 -> 业务模式）*/
+                int mode_check_ret = wait_for_antenna_mode_cycle();
+                if (mode_check_ret != SUCCESS) {
+                    LOG_ERROR("Antenna work mode cycle verification failed");
+                    *result = CONFIG_RESULT_FAILURE;
+
+                    /* 重新加锁以保持函数退出时的锁状态一致 */
+                    pthread_mutex_lock(&g_cell_mgr.mutex);
+                } else {
+                    /* 模式切换验证成功 */
+                    *result = CONFIG_RESULT_SUCCESS;
+
+                    /* 重新加锁以保持函数退出时的锁状态一致 */
+                    pthread_mutex_lock(&g_cell_mgr.mutex);
+
+                    /* 检查全局频点状态并更新发射控制 */
+                    update_tx_control();
+                }
+            }
 
             break;
         }

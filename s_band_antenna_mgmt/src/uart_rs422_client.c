@@ -203,13 +203,13 @@ int uart_rs422_open(uart_rs422_client_t *client)
     }
 
     options.c_cflag |= (CLOCAL | CREAD); /* 本地连接,使能接收 */
-    //options.c_cflag &= ~CRTSCTS;        /* 无硬件流控 */
+    options.c_cflag &= ~CRTSCTS;        /* 无硬件流控 */
 
     /* 原始模式 */
     options.c_lflag &=(~(ICANON|ECHO|ECHOE|ECHOK|ECHONL|ISIG));
     options.c_iflag &= ~(IXON | IXOFF | IXANY);        /*无软件流控*/
-    options.c_iflag &= ~(INLCR | ICRNL | IGNCR);
-    //options.c_iflag &= (~(INPCK|IGNPAR|PARMRK|ISTRIP|ICRNL|IXANY));
+    // options.c_iflag &= ~(INLCR | ICRNL | IGNCR);
+    options.c_iflag &= (~(INPCK|IGNPAR|PARMRK|ISTRIP|ICRNL|IXANY));
 
     if (use_parity) {
         /* 奇校验模式：禁用输入校验检查和剥离 */

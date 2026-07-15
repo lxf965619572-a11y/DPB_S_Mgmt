@@ -40,7 +40,7 @@ detect_network_manager() {
         echo "NetworkManager"
     elif systemctl is-active --quiet systemd-networkd; then
         echo "systemd-networkd"
-    elif [ -f /etc/network/interfaces ] && (command -v ifup &> /dev/null || systemctl list-unit-files networking.service &> /dev/null); then
+    elif [ -f /etc/network/interfaces ]; then
         echo "ifupdown"
     else
         echo "unknown"
@@ -60,7 +60,7 @@ configure_systemd_networkd() {
 Name=eth0
 
 [Network]
-Address=192.168.0.10/24
+Address=192.168.0.11/24
 EOF
 
     # 配置eth1 (BBU通信网口)
@@ -99,7 +99,7 @@ iface lo inet loopback
 # eth0 - 调试网口
 auto eth0
 iface eth0 inet static
-    address 192.168.0.10
+    address 192.168.0.11
     netmask 255.255.255.0
 
 # eth1 - BBU通信网口
@@ -112,22 +112,13 @@ iface eth1 inet static
 EOF
 
     # 重启网络服务
-    if command -v ifdown &> /dev/null && command -v ifup &> /dev/null; then
+    if command -v ifdown &> /dev/null; then
         ifdown eth0 2>/dev/null || true
         ifdown eth1 2>/dev/null || true
         ifup eth0
         ifup eth1
-    elif systemctl list-unit-files networking.service &> /dev/null; then
-        systemctl restart networking
     else
-        log_warn "Neither ifupdown commands nor networking.service found, applying config via ip command"
-        ip addr flush dev eth0 2>/dev/null || true
-        ip addr flush dev eth1 2>/dev/null || true
-        ip addr add 192.168.0.10/24 dev eth0
-        ip addr add 10.10.10.8/24 dev eth1
-        ip link set eth0 up
-        ip link set eth1 up
-        ip route add default via 10.10.10.1 dev eth1 2>/dev/null || true
+        systemctl restart networking
     fi
 
     log_info "ifupdown configuration completed"
@@ -141,7 +132,7 @@ configure_networkmanager() {
     nmcli connection delete eth0 2>/dev/null || true
     nmcli connection add type ethernet con-name eth0 ifname eth0 \
         ipv4.method manual \
-        ipv4.addresses 192.168.0.10/24 \
+        ipv4.addresses 192.168.0.11/24 \
         autoconnect yes
 
     # 配置eth1
@@ -166,7 +157,7 @@ configure_manual() {
 
     # 配置eth0
     ip addr flush dev eth0
-    ip addr add 192.168.0.10/24 dev eth0
+    ip addr add 192.168.0.11/24 dev eth0
     ip link set eth0 up
 
     # 配置eth1
@@ -185,8 +176,8 @@ verify_configuration() {
     sleep 2
 
     # 检查eth0
-    if ip addr show eth0 | grep -q "192.168.0.10"; then
-        log_info "✓ eth0: 192.168.0.10/24 configured"
+    if ip addr show eth0 | grep -q "192.168.0.11"; then
+        log_info "✓ eth0: 192.168.0.11/24 configured"
     else
         log_error "✗ eth0: Failed to configure"
     fi
@@ -262,7 +253,7 @@ main() {
     verify_configuration
 
     log_info "Network configuration completed successfully"
-    log_info "eth0 (调试): 192.168.0.10/24"
+    log_info "eth0 (调试): 192.168.0.11/24"
     log_info "eth1 (BBU):  10.10.10.8/24"
 }
 

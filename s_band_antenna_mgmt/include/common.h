@@ -19,6 +19,13 @@
 #define ERROR_NETWORK      -4
 #define ERROR_TIMEOUT      -5
 #define ERROR_NOT_INITIALIZED -6
+#define ERROR_NOT_READY    -7
+
+/* 相控阵工作模式定义 */
+#define PHASED_ARRAY_MODE_BUSINESS      0  /* 业务模式 */
+#define PHASED_ARRAY_MODE_SPECTRUM      1  /* 频谱监测模式 */
+#define PHASED_ARRAY_MODE_STANDBY       2  /* 待机模式 */
+#define PHASED_ARRAY_MODE_CALIBRATION   3  /* 自校准模式 */
 
 /* 日志级别 */
 typedef enum {

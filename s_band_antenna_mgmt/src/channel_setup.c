@@ -144,6 +144,12 @@ int channel_setup_create_request(cpri_message_t *msg, channel_setup_reason_t rea
         memcpy(phased_cap + 20, &fpga_status.data.supported_modes, 2);
         /* Byte 22-26: Reserve = 0 (已经memset清零) */
 
+        LOG_INFO("Using FPGA capability from telemetry: beams=%u, max_power=%u (%.2f dBm), modes=0x%04X",
+                 fpga_status.data.nr_beam_count,
+                 fpga_status.data.max_tx_power,
+                 fpga_status.data.max_tx_power / 256.0,
+                 fpga_status.data.supported_modes);
+
         /* 填充IE 5: 硬件信息 (48字节)
          * Byte 0-31: 相控阵硬件类型 (32BYTE)
          * Byte 32-47: 相控阵硬件版本号 (16BYTE)
@@ -152,14 +158,19 @@ int channel_setup_create_request(cpri_message_t *msg, channel_setup_reason_t rea
         /* 硬件版本：fpga_status.data.hw_version 是4字节，需要格式化为16字节字符串 */
         snprintf((char*)hw_info + 32, 16, "HW_v%u", fpga_status.data.hw_version);
     } else {
-        /* FPGA状态未就绪，使用默认值 */
+        /* FPGA状态未就绪，使用默认值（基于实际硬件规格：22425 = 87.6 dBm） */
+        LOG_WARN("FPGA status not yet available, using default capability values");
+
         uint32_t default_beam_count = 16;
-        uint16_t default_max_power = 46 * 256;  /* 46 dBm */
+        uint16_t default_max_power = 22425;  /* 实际硬件值：22425 (约87.6 dBm) */
         uint16_t default_modes = 0x03;  /* Bit0: 支持TDD-LTE, Bit1: 支持TDD-NR */
 
         memcpy(phased_cap + 0, &default_beam_count, 4);
         memcpy(phased_cap + 9, &default_max_power, 2);
         memcpy(phased_cap + 20, &default_modes, 2);
+
+        LOG_INFO("Using default capability: beams=%u, max_power=%u (%.2f dBm), modes=0x%04X",
+                 default_beam_count, default_max_power, default_max_power / 256.0, default_modes);
 
         strncpy((char*)hw_info, "S-Band Phased Array", 32);
         strncpy((char*)hw_info + 32, "HW_v1.0", 16);
