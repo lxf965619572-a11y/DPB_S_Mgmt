@@ -1,0 +1,194 @@
+/**
+ * @file test_rs422_protocol.cpp
+ * @brief RS-422协议层单元测试示例
+ */
+
+#include <gtest/gtest.h>
+#include <cstring>
+#include <arpa/inet.h>
+
+extern "C" {
+#include "rs422_protocol.h"
+#include "common.h"
+}
+
+// ============ 测试夹具 ============
+
+class RS422ProtocolTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // 初始化协议层
+        ASSERT_EQ(SUCCESS, rs422_protocol_init());
+        memset(frame_buf, 0, sizeof(frame_buf));
+    }
+
+    void TearDown() override {
+        rs422_protocol_cleanup();
+    }
+
+    uint8_t frame_buf[1024];
+};
+
+// ============ 校验和测试 ============
+
+TEST_F(RS422ProtocolTest, ChecksumCalculation) {
+    uint8_t data[] = {0x01, 0x02, 0x03, 0x04, 0x05};
+    uint16_t checksum = rs422_checksum(data, sizeof(data));
+    // sum = 0x0F, ~sum = 0xFFF0
+    EXPECT_EQ(0xFFF0, checksum);
+}
+
+TEST_F(RS422ProtocolTest, ChecksumEmpty) {
+    uint16_t checksum = rs422_checksum(NULL, 0);
+    EXPECT_EQ(0xFFFF, checksum);
+}
+
+// ============ CRC16测试 ============
+
+TEST_F(RS422ProtocolTest, CRC16Calculation) {
+    // 标准测试向量 "123456789"
+    uint8_t data[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    uint16_t crc = rs422_crc16_ccitt_false(data, sizeof(data));
+    // 标准结果: 0x29B1
+    EXPECT_EQ(0x29B1, crc);
+}
+
+// ============ 帧编码测试 ============
+
+TEST_F(RS422ProtocolTest, EncodeFrameBasic) {
+    uint8_t payload[] = {0xAA, 0xBB, 0xCC};
+
+    int frame_len = rs422_encode_frame(
+        RS422_APID_CONTROL,
+        RS422_CMD_VERSION_QUERY,
+        payload, sizeof(payload),
+        frame_buf, sizeof(frame_buf)
+    );
+
+    // 验证帧长度: 头(8) + 命令码(2) + 载荷(3) + 校验和(2) = 15
+    EXPECT_EQ(15, frame_len);
+
+    // 验证同步字
+    uint16_t sync;
+    memcpy(&sync, frame_buf, 2);
+    EXPECT_EQ(0xEB90, ntohs(sync));
+}
+
+TEST_F(RS422ProtocolTest, EncodeFrameNullPayload) {
+    int frame_len = rs422_encode_frame(
+        RS422_APID_CONTROL,
+        RS422_CMD_RECONFIG_QUERY,
+        NULL, 0,
+        frame_buf, sizeof(frame_buf)
+    );
+
+    // 验证帧长度: 头(8) + 命令码(2) + 校验和(2) = 12
+    EXPECT_EQ(12, frame_len);
+}
+
+// ============ 帧解码测试 ============
+
+TEST_F(RS422ProtocolTest, DecodeFrameBasic) {
+    // 先编码一个帧
+    uint8_t payload_in[] = {0x11, 0x22, 0x33};
+    int frame_len = rs422_encode_frame(
+        RS422_APID_CONTROL,
+        RS422_CMD_VERSION_QUERY,
+        payload_in, sizeof(payload_in),
+        frame_buf, sizeof(frame_buf)
+    );
+    ASSERT_GT(frame_len, 0);
+
+    // 解码帧
+    uint16_t apid, cmd_code;
+    const uint8_t *payload_out;
+    uint32_t payload_len;
+
+    int ret = rs422_decode_frame(
+        frame_buf, frame_len,
+        &apid, &cmd_code,
+        &payload_out, &payload_len
+    );
+
+    EXPECT_EQ(SUCCESS, ret);
+    EXPECT_EQ(RS422_APID_CONTROL, apid);
+    EXPECT_EQ(RS422_CMD_VERSION_QUERY, cmd_code);
+    EXPECT_EQ(sizeof(payload_in), payload_len);
+    EXPECT_EQ(0, memcmp(payload_in, payload_out, payload_len));
+}
+
+TEST_F(RS422ProtocolTest, DecodeFrameInvalidSync) {
+    // 构造错误的同步字
+    frame_buf[0] = 0xFF;
+    frame_buf[1] = 0xFF;
+
+    uint16_t apid, cmd_code;
+    const uint8_t *payload;
+    uint32_t payload_len;
+
+    int ret = rs422_decode_frame(
+        frame_buf, 20,
+        &apid, &cmd_code,
+        &payload, &payload_len
+    );
+
+    EXPECT_NE(SUCCESS, ret);
+}
+
+// ============ 命令构造测试 ============
+
+TEST_F(RS422ProtocolTest, BuildTransferStartCommand) {
+    rs422_cmd_transfer_start_t params;
+    params.device_id = 0x1D;
+    params.file_type = 0xFF;
+    params.file_sub_type = 0x00;
+    params.segment_info = htons((3 << 14) | 100);
+    params.file_length = htonl(102000);
+    params.last_segment_len = htonl(1000);
+    params.file_checksum = htons(0x1234);
+
+    int frame_len = rs422_build_transfer_start(
+        &params,
+        frame_buf, sizeof(frame_buf)
+    );
+
+    // 验证帧长度: 头(8) + 命令码(2) + 载荷(15) + 校验和(2) = 27
+    EXPECT_EQ(27, frame_len);
+}
+
+// ============ 应答解析测试 ============
+
+TEST_F(RS422ProtocolTest, ParseTransferStartAck) {
+    uint8_t payload[] = {RS422_TRANSFER_READY};
+    uint8_t result;
+
+    int ret = rs422_parse_transfer_start_ack(
+        payload, sizeof(payload),
+        &result
+    );
+
+    EXPECT_EQ(SUCCESS, ret);
+    EXPECT_EQ(RS422_TRANSFER_READY, result);
+}
+
+TEST_F(RS422ProtocolTest, GetCommandName) {
+    const char* name = rs422_get_cmd_name(RS422_CMD_TRANSFER_START);
+    EXPECT_NE(nullptr, name);
+    EXPECT_GT(strlen(name), 0);
+}
+
+TEST_F(RS422ProtocolTest, GetResultDescription) {
+    const char* desc = rs422_get_result_desc(
+        RS422_CMD_TRANSFER_START_ACK,
+        RS422_TRANSFER_READY
+    );
+    EXPECT_NE(nullptr, desc);
+    EXPECT_GT(strlen(desc), 0);
+}
+
+// ============ 主函数 ============
+
+int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

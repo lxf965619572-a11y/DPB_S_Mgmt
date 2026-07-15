@@ -1,0 +1,124 @@
+#ifndef CELL_CONFIG_H
+#define CELL_CONFIG_H
+
+#include "common.h"
+#include "cpri_protocol.h"
+
+/* IE类型定义 */
+#define IE_TYPE_CELL_CONFIG         0x5E2   /* 1506: 小区配置 */
+#define IE_TYPE_FREQ_CONFIG         0x5E3   /* 1507: 频点配置 */
+#define IE_TYPE_CELL_CONFIG_RESP    0x5EC   /* 1516: 小区配置响应 */
+#define IE_TYPE_FREQ_CONFIG_RESP    0x5ED   /* 1517: 频点配置响应 */
+
+/* 小区配置标识 */
+typedef enum {
+    CELL_CFG_ESTABLISH = 0,     /* 建立 */
+    CELL_CFG_RECONFIG = 1,      /* 重配 */
+    CELL_CFG_DELETE = 2         /* 删除 */
+} cell_cfg_flag_t;
+
+/* 频点配置标识 */
+typedef enum {
+    FREQ_CFG_ESTABLISH = 0,     /* 建立 */
+    FREQ_CFG_DELETE = 1         /* 删除 */
+} freq_cfg_flag_t;
+
+/* 小区制式 */
+typedef enum {
+    CELL_TYPE_5G_NR = 3         /* 5G NR */
+} cell_type_t;
+
+/* 配置结果 */
+typedef enum {
+    CONFIG_RESULT_SUCCESS = 0,  /* 成功 */
+    CONFIG_RESULT_FAILURE = 1   /* 失败 */
+} config_result_t;
+
+/* 小区配置IE结构 (IE 1506, 10字节payload) */
+typedef struct {
+    uint8_t  cell_cfg_flag;     /* 小区配置标识 (0:建立, 1:重配, 2:删除) */
+    uint32_t local_cell_id;     /* 本地小区标识 */
+    uint16_t cell_power;        /* 小区发射功率 (1/256 dBm) */
+    uint8_t  reserved;          /* 保留 */
+    uint8_t  freq_count;        /* 频点数量 */
+    uint8_t  cell_type;         /* 小区制式 (3: 5G NR) */
+} cell_config_ie_t;
+
+/* 频点配置IE结构 (IE 1507, 32字节payload) */
+typedef struct {
+    uint8_t  freq_cfg_flag;     /* 频点配置标识 (0:建立, 1:删除) */
+    uint32_t local_cell_id;     /* 关联的本地小区标识 */
+    uint8_t  beam_id;           /* 波束号 */
+    uint32_t dl_center_freq;    /* 下行中心频率 (1kHz) */
+    uint32_t reserved1;         /* 保留 */
+    uint8_t  special_subframe;  /* 特殊子帧配置 (bit0-3: 0-8) */
+    uint32_t sys_subframe_num;  /* 配置生效的系统子帧号 (0-4095) */
+    uint32_t beam_bandwidth;    /* 波束带宽 */
+    uint32_t ul_dl_config;      /* 上下行子帧配置 */
+    uint8_t  reserved2;         /* 保留 */
+    uint32_t ul_center_freq;    /* 上行中心频率 (1kHz) */
+} freq_config_ie_t;
+
+/* 小区配置响应IE结构 (IE 1516, 8字节payload) */
+typedef struct {
+    uint32_t local_cell_id;     /* 对应的本地小区标识 */
+    uint32_t result;            /* 小区配置结果 (0:成功, 1:失败) */
+} cell_config_resp_ie_t;
+
+/* 频点配置响应IE结构 (IE 1517, 9字节payload) */
+typedef struct {
+    uint32_t local_cell_id;     /* 对应的本地小区标识 */
+    uint8_t  beam_id;           /* 对应的波束号 */
+    uint32_t result;            /* 频点配置结果 (0:成功, 1:失败) */
+} freq_config_resp_ie_t;
+
+/* 小区信息存储结构 */
+typedef struct {
+    bool     active;            /* 小区是否激活 */
+    uint32_t local_cell_id;     /* 本地小区标识 */
+    uint16_t cell_power;        /* 小区发射功率 */
+    uint8_t  cell_type;         /* 小区制式 */
+    uint8_t  freq_count;        /* 频点数量 */
+} cell_info_t;
+
+/* 频点信息存储结构 */
+typedef struct {
+    bool     active;            /* 频点是否激活 */
+    uint32_t local_cell_id;     /* 关联的小区ID */
+    uint8_t  beam_id;           /* 波束号 */
+    uint32_t dl_center_freq;    /* 下行中心频率 (1kHz) */
+    uint32_t ul_center_freq;    /* 上行中心频率 (1kHz) */
+    uint32_t beam_bandwidth;    /* 波束带宽 */
+    uint32_t ul_dl_config;      /* 上下行子帧配置 */
+    uint8_t  special_subframe;  /* 特殊子帧配置 */
+} freq_info_t;
+
+/* 小区配置管理器 */
+#define MAX_CELLS 16
+#define MAX_FREQS_PER_CELL 16
+
+typedef struct {
+    cell_info_t cells[MAX_CELLS];
+    freq_info_t freqs[MAX_CELLS][MAX_FREQS_PER_CELL];
+    pthread_mutex_t mutex;
+} cell_config_manager_t;
+
+/* 初始化小区配置管理器 */
+int cell_config_init(void);
+
+/* 处理NR小区配置消息 (MsgID 195) */
+int cell_config_handle_request(const cpri_message_t *msg);
+
+/* 生成NR小区配置响应 (MsgID 196) */
+int cell_config_create_response(cpri_message_t *response, const cpri_message_t *request);
+
+/* 销毁小区配置管理器 */
+void cell_config_destroy(void);
+
+/* 内部辅助函数 */
+int cell_config_parse_cell_ie(const uint8_t *ie_data, uint16_t ie_data_len, cell_config_ie_t *cell_cfg);
+int cell_config_parse_freq_ie(const uint8_t *ie_data, uint16_t ie_data_len, freq_config_ie_t *freq_cfg);
+int cell_config_apply_cell(const cell_config_ie_t *cell_cfg, uint32_t *result);
+int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result);
+
+#endif /* CELL_CONFIG_H */

@@ -1,0 +1,33 @@
+# 编译产物
+*.o
+*.so
+*.a
+*.exe
+antenna_mgmt
+build/
+*.out
+
+# 日志文件
+*.log
+logs/
+reports/
+
+# 压缩包
+*.zip
+*.tar
+*.gz
+*.rar
+
+# IDE 配置（可选，如果想保留 VSCode 配置可以注释掉）
+# .vscode/
+
+# 临时文件
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# 测试产物
+test_*.log
+core.*

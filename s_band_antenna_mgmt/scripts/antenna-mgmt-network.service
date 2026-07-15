@@ -1,0 +1,22 @@
+[Unit]
+Description=S-Band Antenna Management Network Configuration
+Documentation=file:///opt/vendor/docs/README.md
+Before=network-online.target
+Wants=network.target
+After=network-pre.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/vendor/scripts/setup-network.sh auto
+TimeoutStartSec=60
+
+# 确保在网络配置之前运行
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=antenna-network
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=network-online.target

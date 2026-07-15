@@ -1,0 +1,72 @@
+# Makefile for s_band_antenna_mgmt testing
+
+CC := gcc
+CXX := g++
+CFLAGS := -Wall -Wextra -I./include -I./src
+CXXFLAGS := -std=c++14 -Wall -Wextra -I./include -I./src
+LDFLAGS := -lgtest -lgtest_main -lpthread -lgcov
+COVERAGE_FLAGS := --coverage -fprofile-arcs -ftest-coverage
+
+BUILD_DIR := build/coverage
+OBJ_DIR := $(BUILD_DIR)/obj
+BIN_DIR := $(BUILD_DIR)/bin
+REPORT_DIR := reports
+
+SRC_C := src/rs422_protocol.c src/logger.c
+SRC_TEST := tests/unit/test_rs422_protocol.cpp
+
+OBJ_C := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRC_C))
+OBJ_TEST := $(OBJ_DIR)/test_rs422_protocol.o
+TEST_BIN := $(BIN_DIR)/test_rs422_protocol
+
+.PHONY: all clean test coverage help
+
+all: test
+
+$(OBJ_DIR) $(BIN_DIR) $(REPORT_DIR)/html $(REPORT_DIR)/xml:
+	@mkdir -p $@
+
+$(OBJ_DIR)/%.o: src/%.c | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -c $< -o $@
+
+$(OBJ_DIR)/test_rs422_protocol.o: tests/unit/test_rs422_protocol.cpp | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) $(COVERAGE_FLAGS) -c $< -o $@
+
+$(TEST_BIN): $(OBJ_C) $(OBJ_TEST) | $(BIN_DIR)
+	@echo "Linking $@..."
+	$(CXX) $(COVERAGE_FLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Checking .gcno files..."
+	@find $(OBJ_DIR) -name "*.gcno" | head -5
+
+test: $(TEST_BIN) | $(REPORT_DIR)/xml
+	@echo "Running tests..."
+	@echo "Before test - checking .gcda files:"
+	@find . -name "*.gcda" 2>/dev/null || echo "  None found"
+	@cd $(BUILD_DIR) && pwd && GTEST_OUTPUT=xml:../../$(REPORT_DIR)/xml/ ./bin/test_rs422_protocol
+	@echo ""
+	@echo "After test - checking .gcda files:"
+	@find . -name "*.gcda" 2>/dev/null || echo "  None found"
+	@echo ""
+	@echo "Checking .gcno files:"
+	@find . -name "*.gcno" 2>/dev/null | head -5
+
+coverage: test | $(REPORT_DIR)/html
+	@echo "Generating coverage report with gcovr..."
+	@gcovr --root . \
+		--exclude '/usr/.*' \
+		--exclude '.*/tests/.*' \
+		--html --html-details \
+		--output $(REPORT_DIR)/html/index.html \
+		--print-summary
+	@echo ""
+	@echo "Coverage report: $(REPORT_DIR)/html/index.html"
+
+clean:
+	@rm -rf $(BUILD_DIR) $(REPORT_DIR)
+	@find . -name "*.gcda" -delete 2>/dev/null || true
+	@find . -name "*.gcno" -delete 2>/dev/null || true
+
+help:
+	@echo "Targets: test, coverage, clean, help"

@@ -1,0 +1,41 @@
+[Unit]
+Description=S-Band Antenna Management Service
+Documentation=file:///opt/vendor/docs/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yt513
+Group=root
+
+# 工作目录指向当前版本
+WorkingDirectory=/opt/vendor/current
+
+# 通过符号链接启动程序
+ExecStart=/opt/vendor/current/antenna_mgmt /opt/vendor/config/antenna_mgmt.conf
+
+# 重启策略
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# 资源限制
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=antenna-mgmt
+
+# 安全加固
+NoNewPrivileges=false
+PrivateTmp=true
+
+# 环境变量
+Environment="LD_LIBRARY_PATH=/opt/vendor/current/lib"
+
+[Install]
+WantedBy=multi-user.target

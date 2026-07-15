@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "fpga_handler.h": "c",
+        "fpga_watchdog.h": "c"
+    }
+}
