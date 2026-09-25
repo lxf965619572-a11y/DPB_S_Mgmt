@@ -19,6 +19,7 @@ static int handle_reconfig_start(fpga_injection_task_t *task);
 static int handle_reconfig_polling(fpga_injection_task_t *task);
 static void transition_state(fpga_injection_task_t *task, fpga_injection_state_t new_state);
 static int send_transfer_abort(fpga_injection_task_t *task);
+static int send_upload_notify(fpga_injection_task_t *task, uint8_t notify_code, const char *when);
 
 int fpga_firmware_injection_init(uart_rs422_client_t *uart_client)
 {
@@ -75,8 +76,7 @@ int fpga_firmware_injection_start(const char *version_dir, const char *version_n
         return ERROR_GENERAL;
     }
 
-    pthread_detach(g_injection_task.injection_thread);
-
+    /* 不 detach：保留可 join，使 cleanup 能在销毁 mutex 前确认线程已退出 */
     pthread_mutex_unlock(&g_injection_task.state_mutex);
 
     LOG_INFO("启动FPGA固件注入任务: %s", version_num);
@@ -145,26 +145,49 @@ int fpga_firmware_injection_wait(uint32_t timeout_sec)
 
 void fpga_firmware_injection_cleanup(void)
 {
-    pthread_mutex_lock(&g_injection_task.state_mutex);
-
-    if (g_injection_task.in_progress) {
+    /* 改造前的问题：请求 abort 后只 sleep(2) 就无条件
+     *   fclose(g_injection_task.bin_fp);  pthread_mutex_destroy(&state_mutex);
+     * 而线程可能仍在跑 —— 对活动 mutex 调 destroy 是 UB，
+     * fclose 线程正在读的文件同样如此（且线程退出时会自己关它，属重复关闭）。
+     *
+     * 现在：请求中止 → 有界等待线程退出 → 确认退出后才 join 并销毁。
+     * 线程的若干长 sleep 不检查 abort（属另一项待修问题），因此不能无限期等；
+     * 等不到就【跳过销毁】——进程随后退出，泄漏一个 mutex 无害，
+     * 对仍被使用的 mutex 调 destroy 才是真问题。 */
+    if (g_injection_task.injection_thread != 0) {
+        pthread_mutex_lock(&g_injection_task.state_mutex);
         g_injection_task.abort_requested = true;
+        bool running = g_injection_task.in_progress;
         pthread_mutex_unlock(&g_injection_task.state_mutex);
 
-        /* 等待线程结束 */
-        sleep(2);
+        if (running) {
+            LOG_WARN("固件注入仍在进行，已请求中止，等待线程退出");
+        }
 
-        pthread_mutex_lock(&g_injection_task.state_mutex);
+        bool exited = false;
+        for (int i = 0; i < 30; i++) {   /* 最多等 3 秒 */
+            pthread_mutex_lock(&g_injection_task.state_mutex);
+            exited = !g_injection_task.in_progress;
+            pthread_mutex_unlock(&g_injection_task.state_mutex);
+            if (exited) {
+                break;
+            }
+            usleep(100 * 1000);
+        }
+
+        if (!exited) {
+            LOG_WARN("注入线程未在 3 秒内退出，跳过 mutex 销毁以避免 use-after-free"
+                     "（进程即将退出）");
+            return;
+        }
+
+        pthread_join(g_injection_task.injection_thread, NULL);
+        g_injection_task.injection_thread = 0;
     }
 
-    if (g_injection_task.bin_fp) {
-        fclose(g_injection_task.bin_fp);
-        g_injection_task.bin_fp = NULL;
-    }
-
-    pthread_mutex_unlock(&g_injection_task.state_mutex);
+    /* bin_fp 由注入线程自己在退出时关闭（injection_thread_func 的 exit_thread 段），
+     * 这里不再重复 fclose，避免与线程竞态。 */
     pthread_mutex_destroy(&g_injection_task.state_mutex);
-
     LOG_INFO("FPGA固件注入器已清理");
 }
 
@@ -204,6 +227,11 @@ static void* injection_thread_func(void *arg)
     fpga_injection_task_t *task = (fpga_injection_task_t *)arg;
 
     LOG_INFO("FPGA固件注入线程已启动");
+
+    /* 上注前通报(尾字节66): 告知目标本方开始给FPGA上注。
+     * 放在线程内而非 fpga_firmware_injection_start(), 以保证它一定早于
+     * exit_thread 处的上注后通报——元数据解析失败时线程会立即退出。 */
+    send_upload_notify(task, RS422_UPLOAD_NOTIFY_PRE, "开始");
 
     while (!task->abort_requested) {
         pthread_mutex_lock(&task->state_mutex);
@@ -253,6 +281,10 @@ static void* injection_thread_func(void *arg)
     }
 
 exit_thread:
+    /* 上注后通报(尾字节67): 成功、失败、被中止三条路径都经此出口,
+     * 因此这里统一发一次, 保证与上注前的通报成对。 */
+    send_upload_notify(task, RS422_UPLOAD_NOTIFY_POST, "结束");
+
     /* 清理资源 */
     if (task->bin_fp) {
         fclose(task->bin_fp);
@@ -492,6 +524,36 @@ static int send_transfer_abort(fpga_injection_task_t *task)
 
     LOG_INFO("已收到传输中止应答(3-10)");
     return SUCCESS;
+}
+
+/* 发送A3P(FPGA)上注通报帧。
+ * notify_code = RS422_UPLOAD_NOTIFY_PRE  上注前(帧尾校验 66)
+ *             = RS422_UPLOAD_NOTIFY_POST 上注后(帧尾校验 67)
+ * 属"告知"性质, 发送失败只记录日志, 不改变上注结果。 */
+static int send_upload_notify(fpga_injection_task_t *task, uint8_t notify_code, const char *when)
+{
+    uint8_t frame_buf[64];
+    int frame_len = rs422_build_upload_notify(notify_code, frame_buf, sizeof(frame_buf));
+
+    if (frame_len <= 0) {
+        LOG_ERROR("构造上注%s通报帧失败: %d", when, frame_len);
+        return frame_len;
+    }
+
+    /* uart_rs422_send_frame 内部已做 NULL / is_open 检查,串口未打开时安全返回 */
+    int ret = uart_rs422_send_frame(task->uart_client, frame_buf, (uint32_t)frame_len);
+
+    /* 通报帧不占用序列号: 回滚后上注帧(3-3/3-5/3-7...)的序号与改动前一致。
+     * 上注前那条在流程起点发出, 因此序号为0(帧内 C0 00), 与现场实测帧一致。 */
+    rs422_seq_counter_rollback();
+
+    if (ret != SUCCESS) {
+        LOG_ERROR("发送上注%s通报帧(A2 07 %02X)失败", when, (unsigned)notify_code);
+    } else {
+        LOG_INFO("已发送上注%s通报帧(A2 07 %02X)", when, (unsigned)notify_code);
+    }
+
+    return ret;
 }
 
 

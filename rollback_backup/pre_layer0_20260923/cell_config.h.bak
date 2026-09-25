@@ -84,7 +84,6 @@ typedef struct {
 /* 频点信息存储结构 */
 typedef struct {
     bool     active;            /* 频点是否激活 */
-    bool     sent_to_antenna;   /* 频点参数是否已成功下发到天线并验证通过 */
     uint32_t local_cell_id;     /* 关联的小区ID */
     uint8_t  beam_id;           /* 波束号 */
     uint32_t dl_center_freq;    /* 下行中心频率 (1kHz) */
@@ -109,11 +108,6 @@ int cell_config_init(void);
 
 /* 处理NR小区配置消息 (MsgID 195) */
 int cell_config_handle_request(const cpri_message_t *msg);
-
-/* 提交NR小区配置请求到异步 worker（MsgID 195）。
- * 由 TCP 接收线程调用：深拷贝请求后立即返回，不阻塞。
- * 频点配置需要等待最长 5 秒的天线模式校验，响应由 worker 在校验结束后发出。 */
-int cell_config_submit_request(const cpri_message_t *msg);
 
 /* 生成NR小区配置响应 (MsgID 196) */
 int cell_config_create_response(cpri_message_t *response, const cpri_message_t *request);

@@ -1,0 +1,19 @@
+[0;1;32m●[0m antenna-mgmt.service - S-Band Antenna Management Service
+   Loaded: loaded (/etc/systemd/system/antenna-mgmt.service; enabled; vendor preset: enabled)
+   Active: [0;1;32mactive (running)[0m since Fri 2025-05-09 14:59:08 HKT; 1 years 7 months ago
+     Docs: file:///opt/vendor/docs/README.md
+ Main PID: 2856 (antenna_mgmt)
+    Tasks: 6 (limit: 4599)
+   CGroup: /system.slice/antenna-mgmt.service
+           └─2856 /opt/vendor/current/antenna_mgmt /opt/vendor/config/antenna_mgmt.conf
+
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [DEBUG] Received 15 bytes from BBU
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [INFO] Dispatching message: type=BBU在位心跳信息, serial=736
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [DEBUG] Received 41 bytes from BBU
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [INFO] Dispatching message: type=PAAU状态查询, serial=737
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [INFO] Handle status query
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [INFO] Handling status query request
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [INFO] Query all beams status
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [INFO] Added 16 beam status responses
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [INFO] Created status query response: 20 IEs, payload_len=201
+Jan 01 09:50:33 yt513 antenna-mgmt[2856]: [2027-01-01 09:50:33] [INFO] Sent status query response (serial_num=737)

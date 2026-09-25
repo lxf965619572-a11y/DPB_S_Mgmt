@@ -113,10 +113,16 @@ int handle_phased_array_calib_request(const cpri_msg_header_t *req_header,
     LOG_INFO("========================================");
     LOG_INFO("Serial Number: %u", req_header->serial_num);
 
-    /* 默认返回成功 */
-    uint8_t result = CALIB_RESULT_SUCCESS;
+    /* 语义说明（重要）：
+     * 本应答表达的是"校准命令是否已成功下发给 FPGA"，【不是】"校准是否成功"。
+     * 校准的真实结果由 FPGA 遥测的 calib_result 字段给出，须通过状态查询
+     * IE 308 获取（见 status_query.c 的 IE_TYPE_CALIB_RESULT_QUERY 分支）。
+     *
+     * 改造前这里直接把 UART write 的返回值称为 "Calibration result" 并打印
+     * "Calibration result: SUCCESS"，容易被读成"校准已完成且成功"——实际此时
+     * FPGA 可能刚开始校准，也可能随后失败。日志文案已按真实语义改写。 */
+    uint8_t dispatch_result = CALIB_RESULT_SUCCESS;
 
-    /* 向FPGA发送校准命令 */
     LOG_INFO("Forwarding calibration command to FPGA");
 
     /* 发送校准命令到FPGA
@@ -126,17 +132,18 @@ int handle_phased_array_calib_request(const cpri_msg_header_t *req_header,
     int fpga_ret = fpga_send_calibration(0);
 
     if (fpga_ret != SUCCESS) {
-        LOG_ERROR("Failed to send calibration command to FPGA");
-        result = CALIB_RESULT_FAILURE;
+        LOG_ERROR("Failed to dispatch calibration command to FPGA");
+        dispatch_result = CALIB_RESULT_FAILURE;
     } else {
-        LOG_INFO("Calibration command sent to FPGA successfully");
-        result = CALIB_RESULT_SUCCESS;
+        LOG_INFO("Calibration command dispatched to FPGA "
+                 "(真实校准结果请经 IE 308 查询 FPGA 遥测 calib_result)");
     }
 
-    LOG_INFO("Calibration result: %s", result == CALIB_RESULT_SUCCESS ? "SUCCESS" : "FAILURE");
+    LOG_INFO("Calibration command dispatch result: %s",
+             dispatch_result == CALIB_RESULT_SUCCESS ? "SENT" : "FAILED");
 
-    /* 发送应答 */
-    int ret = send_phased_array_calib_ack(req_header, result);
+    /* 发送应答（携带的是命令下发结果，非校准结果） */
+    int ret = send_phased_array_calib_ack(req_header, dispatch_result);
 
     LOG_INFO("========================================");
 

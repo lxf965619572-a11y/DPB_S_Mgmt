@@ -12,6 +12,9 @@
 /* 校准结果定义 */
 #define CALIB_RESULT_SUCCESS            0       /* 成功 */
 #define CALIB_RESULT_FAILURE            1       /* 失败 */
+/* 无法判定：遥测不可用，读不到 FPGA 的 calib_result。
+ * 用于替代"遥测拿不到就报成功"的旧行为——宁可报不可判定，也不伪造健康值。 */
+#define CALIB_RESULT_UNAVAILABLE        2
 
 /**
  * 相控阵校准指示 IE (IE ID: 751)

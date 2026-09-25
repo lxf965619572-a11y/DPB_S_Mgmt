@@ -1,10 +1,37 @@
 #include "status_query.h"
 #include "fpga_handler.h"
+#include "phased_array_calib.h"
+#include "config.h"
 #include "logger.h"
 #include <string.h>
 
 /* 预分配缓冲区大小 */
 #define MAX_PAYLOAD_SIZE 4096
+
+/* ==================== 校准结果查询的取值策略 ====================
+ * 改造前 IE 308 的应答恒填 0（成功），完全不读 FPGA；而遥测帧里 calib_result
+ * （数据区 byte 85）一直是解码好的，只是全项目没有一个读取者。后果是硬件报
+ * 校准失败时 BBU 仍收到"成功"，相控阵可能长期带错误相位/幅度工作。
+ *
+ * 配置项 CALIB_QUERY_REPORT_REAL：
+ *   1 = 如实回报遥测里的校准结果（默认）
+ *   0 = 兼容旧行为，恒报成功（仅当 BBU 侧尚未准备好接收失败时使用）
+ *
+ * 遥测不可用时回报 CALIB_RESULT_UNAVAILABLE(2)，不伪造成功。
+ * ============================================================== */
+static int  g_calib_report_real = 1;
+static bool g_calib_query_cfg_loaded = false;
+
+static void calib_query_cfg_load(void)
+{
+    if (g_calib_query_cfg_loaded) {
+        return;
+    }
+    g_calib_report_real = config_get_int("CALIB_QUERY_REPORT_REAL", 1);
+    g_calib_query_cfg_loaded = true;
+    LOG_INFO("Calibration query reporting: report_real=%d (0=恒报成功, 1=如实回报)",
+             g_calib_report_real);
+}
 
 /* 添加IE到载荷 */
 static int add_ie(uint8_t **payload, uint32_t *offset, uint16_t ie_type,
@@ -73,7 +100,8 @@ int status_query_create_response(cpri_message_t *response, const cpri_message_t 
         memcpy(&ie_type, request->payload + req_offset, 2);
         memcpy(&ie_len, request->payload + req_offset + 2, 2);
 
-        if (req_offset + ie_len > request->payload_len) {
+        /* IE长度包含IE头本身，不能小于IE头长度(4字节)；否则 offset 不推进将导致死循环 */
+        if (ie_len < 4 || req_offset + ie_len > request->payload_len) {
             break;
         }
 
@@ -216,12 +244,29 @@ int status_query_create_response(cpri_message_t *response, const cpri_message_t 
             }
 
             case IE_TYPE_CALIB_RESULT_QUERY: {
-                /* 校准结果查询 */
+                /* 校准结果查询：读 FPGA 遥测里的真实结果，不再恒填成功 */
                 uint8_t calib_resp[1];
-                calib_resp[0] = 0;  /* 0=成功 */
+
+                calib_query_cfg_load();
+
+                if (!g_calib_report_real) {
+                    /* 兼容开关：CALIB_QUERY_REPORT_REAL=0 时保持旧行为 */
+                    calib_resp[0] = CALIB_RESULT_SUCCESS;
+                } else if (!has_fpga_status) {
+                    /* 遥测不可用：如实回报"无法判定"，不伪造成功 */
+                    calib_resp[0] = CALIB_RESULT_UNAVAILABLE;
+                    LOG_WARN("Calibration result query: FPGA telemetry unavailable, "
+                             "reporting UNAVAILABLE(%d)", CALIB_RESULT_UNAVAILABLE);
+                } else {
+                    /* FPGA 遥测定义：0=成功，其他=失败 */
+                    uint8_t raw = fpga_status.data.calib_result;
+                    calib_resp[0] = (raw == 0) ? CALIB_RESULT_SUCCESS : CALIB_RESULT_FAILURE;
+                    if (calib_resp[0] != CALIB_RESULT_SUCCESS) {
+                        LOG_WARN("Calibration result query: FPGA reports FAILURE (raw=%u)", raw);
+                    }
+                }
 
                 add_ie(&payload, &offset, IE_TYPE_CALIB_RESULT_RESP, calib_resp, sizeof(calib_resp));
-               // LOG_DEBUG("Added calibration result response: result=%u", calib_resp[0]);
                 break;
             }
 

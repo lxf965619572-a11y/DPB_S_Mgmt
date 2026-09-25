@@ -21,6 +21,7 @@ typedef struct {
     pthread_t reconnect_thread;
     bool running;
     pthread_mutex_t state_mutex;
+    pthread_mutex_t send_mutex;     /* 串行化 tcp_client_send：多线程并发写同一socket会交织字节流 */
 
     /* 回调函数 */
     void (*on_connected)(void);

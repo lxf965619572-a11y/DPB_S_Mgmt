@@ -187,7 +187,8 @@ static int handle_config_ie(const cpri_message_t *request, cpri_message_t *respo
         LOG_DEBUG("Parsing IE: ie_type=%u, ie_length=%u at offset=%u",
                   ie_type, ie_length, offset);
 
-        if (offset + ie_length > payload_len) {
+        /* IE长度包含IE头本身，不能小于IE头长度(4字节)；否则 offset 不推进将导致死循环 */
+        if (ie_length < 4 || offset + ie_length > payload_len) {
             LOG_ERROR("IE length exceeds payload: ie_type=%u, ie_length=%u, offset=%u, payload_len=%u",
                       ie_type, ie_length, offset, payload_len);
             break;

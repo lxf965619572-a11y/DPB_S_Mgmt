@@ -35,6 +35,10 @@ int fpga_send_freq_band(uint32_t dl_freq, uint32_t ul_freq, uint32_t bandwidth);
 int fpga_send_system_time(void);
 int fpga_send_tx_control(uint8_t tx_enable);
 int fpga_send_power_off_ack(void);
+int fpga_send_passthrough(const uint8_t *data, uint32_t data_len);
+
+/* 发送原始数据到FPGA（不加FPGA帧封装，用于透传内容转发） */
+int fpga_send_raw(const uint8_t *data, uint32_t data_len);
 
 /* 设置CPRI工作模式 (用于参数配置) */
 int fpga_handler_set_work_mode(uint32_t work_mode);

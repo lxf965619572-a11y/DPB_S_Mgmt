@@ -51,8 +51,11 @@ static inline uint32_t get_next_serial_num(void)
 static void signal_handler(int signo)
 {
     if (signo == SIGINT || signo == SIGTERM) {
-        LOG_INFO("Received signal %d, shutting down...", signo);
+        /* 必须先置退出标志：LOG_* 会取 g_log_mutex 并做文件 I/O，
+         * 在信号处理器中属 async-signal-unsafe，可能自死锁。
+         * 先置标志可保证即使 LOG 卡住，主循环与其他线程仍能正常退出。 */
         g_running = false;
+        LOG_INFO("Received signal %d, shutting down...", signo);
     }
 }
 
@@ -422,6 +425,11 @@ int main(int argc, char *argv[])
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    /* 忽略 SIGPIPE：tcp_client_send 的 send() 未带 MSG_NOSIGNAL，
+     * 对端 RST 后写入会触发 SIGPIPE，默认处置是终止进程，
+     * 期间 FPGA 看门狗喂狗线程停止（可能触发硬件复位）。 */
+    signal(SIGPIPE, SIG_IGN);
+
     LOG_INFO("System running, press Ctrl+C to exit");
 
     /* 主循环 */
@@ -492,13 +500,18 @@ cleanup:
     rs422_protocol_cleanup();
 
     heartbeat_stop();
+
+    /* cell_config 的 worker 线程会在响应时调用 tcp_client_send 并读 fpga_handler，
+     * 所以必须在拆 TCP 客户端与 fpga_handler 之前先停它（内部 join，可能等一次 5 秒模式校验）。
+     * 否则 worker 可能在 send_mutex 被销毁后仍去锁它。 */
+    cell_config_destroy();
+
     tcp_client_stop(&g_tcp_client);
     tcp_client_destroy(&g_tcp_client);
     uart_client_close(&g_uart_client);
     uart_client_destroy(&g_uart_client);
     fpga_handler_destroy();
     heartbeat_destroy();
-    cell_config_destroy();
     alarm_manager_destroy();
     log_upload_destroy();
     version_manager_destroy();

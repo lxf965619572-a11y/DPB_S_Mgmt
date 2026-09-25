@@ -34,6 +34,15 @@
 #define RS422_CMD_TRANSFER_ABORT        0x018F  /* 3-9: 传输异常中止 */
 #define RS422_CMD_ABORT_ACK             0x018E  /* 3-10: 中止应答 */
 
+/* A3P(FPGA)上注通报指令 —— 与现场实测帧逐字节一致:
+ *   上注前 EB 90 01 80 C0 00 00 03 A2 07 02 AA FD 66
+ *   上注后 EB 90 01 80 C0 00 00 03 A2 07 01 AA FD 67
+ * 用于向上注目标表明"本方正在给FPGA上注"。 */
+#define RS422_CMD_UPLOAD_NOTIFY         0xA207  /* 上注通报命令码 */
+#define RS422_UPLOAD_NOTIFY_PRE         0x02    /* 上注前: 载荷 {02 AA} -> 帧尾校验 FD 66 */
+#define RS422_UPLOAD_NOTIFY_POST        0x01    /* 上注后: 载荷 {01 AA} -> 帧尾校验 FD 67 */
+#define RS422_UPLOAD_NOTIFY_FILLER      0xAA    /* 载荷第2字节固定填充 */
+
 /* ========== 结果码定义 ========== */
 
 /* 重构结果 (1-3 响应) */
@@ -221,6 +230,17 @@ int rs422_decode_frame(const uint8_t *frame_buf, uint32_t frame_len,
  */
 int rs422_build_reconfig_start(uint8_t file_type, uint8_t file_sub_type,
                                 uint8_t *frame_buf, uint32_t frame_buf_size);
+
+/**
+ * @brief 构造A3P(FPGA)上注通报帧
+ * @param notify_code 通报类型: RS422_UPLOAD_NOTIFY_PRE(上注前) /
+ *                    RS422_UPLOAD_NOTIFY_POST(上注后)
+ * @param frame_buf 输出:帧缓冲区
+ * @param frame_buf_size 缓冲区大小
+ * @return 成功返回帧长度,失败返回负数错误码
+ */
+int rs422_build_upload_notify(uint8_t notify_code,
+                               uint8_t *frame_buf, uint32_t frame_buf_size);
 
 /**
  * @brief 构造重构查询命令(1-2)

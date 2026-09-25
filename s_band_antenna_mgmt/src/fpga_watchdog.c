@@ -7,6 +7,13 @@
 /* 全局看门狗管理器 */
 static fpga_watchdog_manager_t g_watchdog_mgr;
 
+/* g_watchdog_mgr.mutex 是否处于"已初始化且尚未销毁"的状态。
+ * 必要性：init 在 GPIO 初始化失败时会把 mutex 销毁再返回失败（见 init 内），
+ * 而 main.c 把它当非致命错误继续运行，清理阶段又无条件调用 stop/destroy ——
+ * 对已销毁（或从未初始化）的 mutex 加锁/再销毁都是 UB。
+ * 所有触及该 mutex 的入口都先查这个标志。 */
+static bool g_watchdog_mutex_ready = false;
+
 /* GPIO配置 */
 static gpio_config_t g_watchdog_gpio;
 
@@ -339,6 +346,7 @@ int fpga_watchdog_init(uint32_t gpio_base, uint32_t pin_mux_offset,
         LOG_ERROR("Failed to init watchdog mutex");
         return ERROR_GENERAL;
     }
+    g_watchdog_mutex_ready = true;
 
     LOG_INFO("Initializing FPGA watchdog...");
     LOG_INFO("  GPIO base: 0x%08x", gpio_base);
@@ -371,6 +379,7 @@ int fpga_watchdog_init(uint32_t gpio_base, uint32_t pin_mux_offset,
     if (ret != 0) {
         LOG_ERROR("Failed to initialize watchdog GPIO");
         pthread_mutex_destroy(&g_watchdog_mgr.mutex);
+        g_watchdog_mutex_ready = false;   /* 已销毁，后续 stop/destroy 不得再碰它 */
         return ERROR_GENERAL;
     }
 
@@ -380,6 +389,11 @@ int fpga_watchdog_init(uint32_t gpio_base, uint32_t pin_mux_offset,
 
 int fpga_watchdog_start(void)
 {
+    if (!g_watchdog_mutex_ready) {
+        LOG_ERROR("Watchdog not initialized, cannot start");
+        return ERROR_GENERAL;
+    }
+
     pthread_mutex_lock(&g_watchdog_mgr.mutex);
 
     if (g_watchdog_mgr.enabled) {
@@ -406,6 +420,11 @@ int fpga_watchdog_start(void)
 
 int fpga_watchdog_stop(void)
 {
+    if (!g_watchdog_mutex_ready) {
+        /* 未初始化或已销毁：没有线程可停，安全返回 */
+        return SUCCESS;
+    }
+
     pthread_mutex_lock(&g_watchdog_mgr.mutex);
 
     if (!g_watchdog_mgr.enabled) {
@@ -427,6 +446,10 @@ int fpga_watchdog_stop(void)
 
 bool fpga_watchdog_is_running(void)
 {
+    if (!g_watchdog_mutex_ready) {
+        return false;
+    }
+
     pthread_mutex_lock(&g_watchdog_mgr.mutex);
     bool running = g_watchdog_mgr.enabled;
     pthread_mutex_unlock(&g_watchdog_mgr.mutex);
@@ -435,6 +458,10 @@ bool fpga_watchdog_is_running(void)
 
 void fpga_watchdog_destroy(void)
 {
+    /* 先停喂狗线程并 join，再解除映射。
+     * 否则线程可能仍在 watchdog_feed() 里访问已 munmap 的地址（use-after-unmap）。 */
+    fpga_watchdog_stop();
+
     /* 释放GPIO内存映射 */
     if (gpio_mapped_base) {
         munmap(gpio_mapped_base, 0x1000);
@@ -453,6 +480,10 @@ void fpga_watchdog_destroy(void)
         mem_fd = -1;
     }
 
-    pthread_mutex_destroy(&g_watchdog_mgr.mutex);
+    /* 只在 mutex 确实处于已初始化状态时才销毁，并置标志使本函数可安全重复调用 */
+    if (g_watchdog_mutex_ready) {
+        pthread_mutex_destroy(&g_watchdog_mgr.mutex);
+        g_watchdog_mutex_ready = false;
+    }
     LOG_INFO("FPGA watchdog manager destroyed");
 }

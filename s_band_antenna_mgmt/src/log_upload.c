@@ -2,6 +2,7 @@
 #include "logger.h"
 #include "tcp_client.h"
 #include "config.h"
+#include "shell_util.h"
 #include <sys/stat.h>
 #include <pthread.h>
 
@@ -111,7 +112,6 @@ static int ftp_upload_file_with_curl(const char *local_file,
                                       const char *remote_path,
                                       const char *file_name)
 {
-    char cmd[2048];
     char full_url[512];
 
     /* 构造FTP URL: ftp://server:port/remote_path/file_name */
@@ -129,33 +129,32 @@ static int ftp_upload_file_with_curl(const char *local_file,
                 ftp_server, ftp_port, file_name);
     }
 
-    /* 构造curl命令 - 使用匿名登录，支持断点续传和超时控制 */
-    snprintf(cmd, sizeof(cmd),
-            "curl -S --ftp-create-dirs -C - -T \"%s\" --user anonymous: \"%s\" "
-            "--connect-timeout 30 --max-time 7200 --speed-limit 512 --speed-time 120 "
-            "--retry 3 --retry-delay 5 2>&1",
-            local_file, full_url);
+    /* argv 数组传参，不经过 shell：
+     * full_url 含北向可控的 store_path（IE 1201），走 shell 会被 $() 与反引号注入。
+     * 使用匿名登录，支持断点续传和超时控制。 */
+    char *curl_argv[] = { (char *)"curl", (char *)"-S", (char *)"--ftp-create-dirs",
+                          (char *)"-C", (char *)"-", (char *)"-T", (char *)local_file,
+                          (char *)"--user", (char *)"anonymous:",
+                          (char *)"--connect-timeout", (char *)"30",
+                          (char *)"--max-time", (char *)"7200",
+                          (char *)"--speed-limit", (char *)"512",
+                          (char *)"--speed-time", (char *)"120",
+                          (char *)"--retry", (char *)"3",
+                          (char *)"--retry-delay", (char *)"5",
+                          full_url, NULL };
 
-    LOG_INFO("Executing FTP upload: %s", cmd);
+    LOG_INFO("Executing FTP upload: %s -> %s", local_file, full_url);
 
-    /* 执行curl命令 */
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
+    /* 读取curl输出（shell_run 返回 waitpid 原始状态，下方 WEXITSTATUS 仍适用） */
+    char output[4096] = {0};
+    int status = shell_run(curl_argv, output, sizeof(output));
+    if (status < 0) {
         LOG_ERROR("Failed to execute curl command");
         return ERROR_GENERAL;
     }
 
-    /* 读取curl输出 */
-    char output[4096] = {0};
-    size_t bytes_read = fread(output, 1, sizeof(output) - 1, fp);
-    int status = pclose(fp);
-
-    if (bytes_read > 0) {
-        output[bytes_read] = '\0';
-        /* 如果有输出，通常表示有错误或警告 */
-        if (strlen(output) > 0) {
-            LOG_WARN("curl output: %s", output);
-        }
+    if (strlen(output) > 0) {
+        LOG_WARN("curl output: %s", output);
     }
 
     /* 检查curl返回状态 */
@@ -216,10 +215,10 @@ static void* log_upload_thread_func(void *arg)
 
     /* 复制日志文件到临时文件（避免上传过程中文件被修改） */
     LOG_INFO("Creating snapshot of log file: %s", temp_file);
-    char cp_cmd[1024];
-    snprintf(cp_cmd, sizeof(cp_cmd), "cp \"%s\" \"%s\"", task->log_file_path, temp_file);
-
-    int cp_ret = system(cp_cmd);
+    /* argv 数组传参，不经过 shell（路径来自配置，非北向可控，仍统一走无 shell 路径） */
+    char *cp_argv[] = { (char *)"cp", task->log_file_path, temp_file, NULL };
+    char cp_out[256] = {0};
+    int cp_ret = shell_run(cp_argv, cp_out, sizeof(cp_out));
     if (cp_ret != 0) {
         LOG_ERROR("Failed to create log file snapshot (exit code: %d)", cp_ret);
         result = LOG_UPLOAD_FAILED;
@@ -302,8 +301,30 @@ int log_upload_handle_request(const cpri_message_t *msg)
     g_upload_in_progress = true;
     pthread_mutex_unlock(&g_upload_mutex);
 
-    /* 解析IE 1201 */
+    /* 解析IE 1201。先校验长度：store_path 是 200 字节裸字段，
+     * payload 短于结构体时读到的是内存池里上一条报文的残留字节。 */
+    if (msg->payload_len < sizeof(ie_log_upload_req_t)) {
+        LOG_ERROR("Log upload request too short: %u < %zu",
+                  msg->payload_len, sizeof(ie_log_upload_req_t));
+        pthread_mutex_lock(&g_upload_mutex);
+        g_upload_in_progress = false;
+        pthread_mutex_unlock(&g_upload_mutex);
+        send_log_upload_ack(&msg->header, LOG_UPLOAD_ACK_REJECT);
+        return ERROR_INVALID_PARAM;
+    }
+
     ie_log_upload_req_t *ie_req = (ie_log_upload_req_t *)msg->payload;
+
+    /* store_path 由北向报文提供并直接进 FTP URL；先校验再使用/打印：
+     * 拒绝含 ".." 的写法以阻断路径穿越，同时避免对未校验数据做 %s 打印。 */
+    if (!shell_safe_relpath(ie_req->store_path)) {
+        LOG_ERROR("Rejected log upload: unsafe store_path");
+        pthread_mutex_lock(&g_upload_mutex);
+        g_upload_in_progress = false;
+        pthread_mutex_unlock(&g_upload_mutex);
+        send_log_upload_ack(&msg->header, LOG_UPLOAD_ACK_REJECT);
+        return ERROR_INVALID_PARAM;
+    }
 
     LOG_INFO("Received log upload request: store_path=%s", ie_req->store_path);
 

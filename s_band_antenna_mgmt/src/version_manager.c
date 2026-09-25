@@ -3,6 +3,7 @@
 #include "tcp_client.h"
 #include "config.h"
 #include "fpga_firmware_injector.h"
+#include "shell_util.h"
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
@@ -82,26 +83,22 @@ static int calculate_sha256(const char *file_path, char *checksum_hex)
 /* 解压tar文件 */
 static int extract_tar_file(const char *tar_path, const char *dest_dir)
 {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "tar -xzf \"%s\" -C \"%s\" 2>&1", tar_path, dest_dir);
+    /* 用 argv 数组传参，不经过 shell：
+     * tar_path / dest_dir 均由北向报文字段拼成，走 shell 会被 $() 与反引号注入。 */
+    char *argv[] = { (char *)"tar", (char *)"-xzf", (char *)tar_path,
+                     (char *)"-C", (char *)dest_dir, NULL };
 
-    LOG_INFO("Extracting tar file: %s", cmd);
+    LOG_INFO("Extracting tar file: %s -> %s", tar_path, dest_dir);
 
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
+    char output[1024] = {0};
+    int status = shell_run(argv, output, sizeof(output));
+    if (status < 0) {
         LOG_ERROR("Failed to execute tar command");
         return ERROR_GENERAL;
     }
 
-    char output[1024] = {0};
-    size_t bytes_read = fread(output, 1, sizeof(output) - 1, fp);
-    int status = pclose(fp);
-
-    if (bytes_read > 0) {
-        output[bytes_read] = '\0';
-        if (strlen(output) > 0) {
-            LOG_WARN("tar output: %s", output);
-        }
+    if (strlen(output) > 0) {
+        LOG_WARN("tar output: %s", output);
     }
 
     if (status != 0) {
@@ -492,7 +489,6 @@ static int ftp_download_file_with_curl(const char *ftp_server,
                                         const char *local_file,
                                         int retry_count)
 {
-    char cmd[1024];
     char full_url[512];
     int attempt = 0;
 
@@ -517,29 +513,25 @@ static int ftp_download_file_with_curl(const char *ftp_server,
             sleep(5);  /* 重试间隔5秒 */
         }
 
-        /* 构造curl命令 - 简化参数以提高兼容性 */
-        snprintf(cmd, sizeof(cmd),
-                "curl -s -S --connect-timeout 30 --max-time 600 "
-                "-o \"%s\" \"%s\" 2>&1",
-                local_file, full_url);
+        /* argv 数组传参，不经过 shell：
+         * full_url / local_file 都含北向可控字段（file_path / file_name）。 */
+        char *curl_argv[] = { (char *)"curl", (char *)"-s", (char *)"-S",
+                              (char *)"--connect-timeout", (char *)"30",
+                              (char *)"--max-time", (char *)"600",
+                              (char *)"-o", (char *)local_file, full_url, NULL };
 
-        LOG_INFO("Executing FTP download (attempt %d): %s", attempt + 1, cmd);
+        LOG_INFO("Executing FTP download (attempt %d): %s -> %s",
+                 attempt + 1, full_url, local_file);
 
-        FILE *fp = popen(cmd, "r");
-        if (!fp) {
+        char output[1024] = {0};
+        int status = shell_run(curl_argv, output, sizeof(output));
+        if (status < 0) {
             LOG_ERROR("Failed to execute curl command");
             continue;
         }
 
-        char output[1024] = {0};
-        size_t bytes_read = fread(output, 1, sizeof(output) - 1, fp);
-        int status = pclose(fp);
-
-        if (bytes_read > 0) {
-            output[bytes_read] = '\0';
-            if (strlen(output) > 0) {
-                LOG_WARN("curl output: %s", output);
-            }
+        if (strlen(output) > 0) {
+            LOG_WARN("curl output: %s", output);
         }
 
         if (status == 0) {
@@ -714,11 +706,13 @@ static void* version_download_thread_func(void *arg)
     if (result != DOWNLOAD_RESULT_SUCCESS) {
         LOG_ERROR("File checksum verification FAILED");
         /* 删除已解压的文件（安全措施） */
-        char cleanup_cmd[1024];
-        snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -rf \"%s\"", version_dir);
-        int cleanup_ret = system(cleanup_cmd);
+        /* argv 数组传参，不经过 shell（version_dir 含北向可控的版本号字段） */
+        char *cleanup_argv[] = { (char *)"rm", (char *)"-rf", (char *)version_dir, NULL };
+        char cleanup_out[256] = {0};
+        int cleanup_ret = shell_run(cleanup_argv, cleanup_out, sizeof(cleanup_out));
         if (cleanup_ret != 0) {
-            LOG_WARN("Failed to cleanup corrupted directory: %s (ret=%d)", version_dir, cleanup_ret);
+            LOG_WARN("Failed to cleanup corrupted directory: %s (ret=%d, out=%s)",
+                     version_dir, cleanup_ret, cleanup_out);
         }
         LOG_WARN("Removed corrupted version directory: %s", version_dir);
         goto send_result;
@@ -744,9 +738,16 @@ static void* version_download_thread_func(void *arg)
                 struct stat st_check;
                 if (stat(new_version_dir, &st_check) == 0) {
                     LOG_WARN("Version directory already exists: %s, removing old version", new_version_dir);
-                    char rm_cmd[1024];
-                    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf \"%s\"", new_version_dir);
-                    system(rm_cmd);
+                    /* argv 数组传参，不经过 shell。
+                     * 注意 new_version_dir 的名字来自解压出来的 metadata.txt，
+                     * 属于二阶注入面（tarball 本身来自北向指定的下载路径）。 */
+                    char *rm_argv[] = { (char *)"rm", (char *)"-rf", (char *)new_version_dir, NULL };
+                    char rm_out[256] = {0};
+                    int rm_ret = shell_run(rm_argv, rm_out, sizeof(rm_out));
+                    if (rm_ret != 0) {
+                        LOG_WARN("Failed to remove existing version dir %s (ret=%d, out=%s)",
+                                 new_version_dir, rm_ret, rm_out);
+                    }
                 }
 
                 /* 重命名目录 */
@@ -974,6 +975,11 @@ int version_handle_download_request(const cpri_message_t *msg)
         send_version_download_ack(&msg->header, ie_req->ver_type, DOWNLOAD_ACK_REJECT_BUSY);
         return ERROR_GENERAL;
     }
+    /* 清空任务结构 + 置闸门必须在【同一个持锁区间】内完成。
+     * 原代码是「持锁置 in_progress=true → 解锁 → memset」：memset 把刚置上的标志
+     * 抹回 0，闸门形同虚设，第二个下载请求能通过上面的检查，
+     * 两个线程操作同一个全局任务与同一个版本目录（并发 tar/rm/rename）。 */
+    memset(&g_download_task, 0, sizeof(g_download_task));
     g_download_task.in_progress = true;
     pthread_mutex_unlock(&g_download_mutex);
 
@@ -982,9 +988,6 @@ int version_handle_download_request(const cpri_message_t *msg)
 
     LOG_INFO("Received version download request: version=%s, file=%s",
             ie_req->file_ver, ie_req->file_name);
-
-    /* 准备下载任务 */
-    memset(&g_download_task, 0, sizeof(g_download_task));
 
     /* 根据版本类型确定临时版本号 */
     if (ie_req->ver_type == VERSION_TYPE_SOFTWARE) {
@@ -1037,7 +1040,23 @@ int version_handle_download_request(const cpri_message_t *msg)
     strncpy(g_download_task.file_time, ie_req->file_time, sizeof(g_download_task.file_time) - 1);
     g_download_task.file_len = ie_req->file_len;
     g_download_task.ver_type = ie_req->ver_type;
-    g_download_task.in_progress = true;
+
+    /* 校验北向可控的名称字段。它们会被拼进本地路径并交给 tar/rm：
+     *   - 含 '/' 或 ".." 可穿越出 /opt/vendor/versions/ 之外（如 rm -rf ../../..）；
+     *   - 为空会让 version_dir 退化成 VERSION_BASE_DIR 本身，进而把整个版本目录删掉。
+     * 两者都必须拒绝。 */
+    if (!shell_safe_name(g_download_task.version) ||
+        !shell_safe_name(g_download_task.file_name)) {
+        LOG_ERROR("Rejected version download: unsafe name (version='%s', file_name='%s')",
+                  g_download_task.version, g_download_task.file_name);
+        send_version_download_result(&msg->header, ie_req->ver_type, DOWNLOAD_RESULT_OTHER);
+        /* 闸门在此处已置位（见函数开头的持锁区间），提前返回必须放闸，
+         * 否则后续所有下载请求都会被"already in progress"永久拒绝。 */
+        pthread_mutex_lock(&g_download_mutex);
+        g_download_task.in_progress = false;
+        pthread_mutex_unlock(&g_download_mutex);
+        return ERROR_INVALID_PARAM;
+    }
 
     /* 设置FTP服务器信息 */
     const char *ftp_server = config_get_string("FTP_SERVER", g_config.bbu_ip);

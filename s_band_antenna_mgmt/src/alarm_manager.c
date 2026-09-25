@@ -14,6 +14,9 @@
 static alarm_manager_t g_alarm_mgr;
 static alarm_config_t g_alarm_config;
 
+/* g_alarm_mgr.mutex 是否处于"已初始化且未销毁"状态，使 destroy 在 init 失败时也安全 */
+static bool g_alarm_mutex_ready = false;
+
 /* 外部TCP客户端引用 */
 extern tcp_client_t g_tcp_client;
 extern uint32_t g_serial_num;
@@ -88,6 +91,7 @@ int alarm_manager_init(const alarm_config_t *config)
         LOG_ERROR("Failed to init alarm manager mutex");
         return ERROR_GENERAL;
     }
+    g_alarm_mutex_ready = true;
 
     g_alarm_mgr.tcp_connected = false;
     g_alarm_mgr.pending_tcp_alarm = false;
@@ -102,7 +106,12 @@ int alarm_manager_init(const alarm_config_t *config)
 /* 销毁告警管理器 */
 void alarm_manager_destroy(void)
 {
-    pthread_mutex_destroy(&g_alarm_mgr.mutex);
+    /* 只在 mutex 确实初始化过时才销毁：init 失败（含 mutex init 本身失败）时
+     * main.c 的清理仍会无条件调用本函数，对未初始化的 mutex 调 destroy 是 UB。 */
+    if (g_alarm_mutex_ready) {
+        pthread_mutex_destroy(&g_alarm_mgr.mutex);
+        g_alarm_mutex_ready = false;
+    }
     LOG_INFO("Alarm manager destroyed");
 }
 

@@ -3,6 +3,7 @@
 #include <libgen.h>
 #include <string.h>
 #include "logger.h"
+#include "shell_util.h"
 
 static FILE *g_log_file = NULL;
 static log_level_t g_log_level = LOG_LEVEL_INFO;
@@ -139,9 +140,10 @@ int logger_init(const char *log_file, log_level_t level)
 
             if (stat(dir, &st) == -1) {
                 /* 目录不存在，创建它 */
-                char mkdir_cmd[512];
-                snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", dir);
-                if (system(mkdir_cmd) != 0) {
+                /* argv 数组传参，不经过 shell */
+                char *mkdir_argv[] = { (char *)"mkdir", (char *)"-p", dir, NULL };
+                char mkdir_out[256] = {0};
+                if (shell_run(mkdir_argv, mkdir_out, sizeof(mkdir_out)) != 0) {
                     fprintf(stderr, "Failed to create log directory: %s\n", dir);
                     free(log_file_copy);
                     return ERROR_GENERAL;
@@ -223,8 +225,13 @@ void logger_log(log_level_t level, const char *file, int line, const char *fmt, 
 
 void logger_close(void)
 {
+    /* 必须与 logger_log 共用同一把锁，否则存在如下竞态：
+     * logger_log 在 :217 判断 g_log_file 非空后、尚未 fprintf 时，
+     * 本函数把文件 fclose 并置 NULL → 对已关闭的 FILE* 写入（use-after-free）。 */
+    pthread_mutex_lock(&g_log_mutex);
     if (g_log_file) {
         fclose(g_log_file);
         g_log_file = NULL;
     }
+    pthread_mutex_unlock(&g_log_mutex);
 }

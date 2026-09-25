@@ -392,6 +392,16 @@ int rs422_build_transfer_abort(uint8_t *frame_buf, uint32_t frame_buf_size)
                               NULL, 0, frame_buf, frame_buf_size);
 }
 
+/* 构造A3P(FPGA)上注通报帧。notify_code取 RS422_UPLOAD_NOTIFY_PRE / _POST */
+int rs422_build_upload_notify(uint8_t notify_code,
+                               uint8_t *frame_buf, uint32_t frame_buf_size)
+{
+    uint8_t payload[2] = { notify_code, RS422_UPLOAD_NOTIFY_FILLER };
+
+    return rs422_encode_frame(RS422_APID_CONTROL, RS422_CMD_UPLOAD_NOTIFY,
+                              payload, sizeof(payload), frame_buf, frame_buf_size);
+}
+
 const char* rs422_get_cmd_name(uint16_t cmd_code)
 {
     switch (cmd_code) {
@@ -408,6 +418,7 @@ const char* rs422_get_cmd_name(uint16_t cmd_code)
         case RS422_CMD_TRANSFER_END_ACK:    return "传输结束应答(3-8)";
         case RS422_CMD_TRANSFER_ABORT:      return "传输中止(3-9)";
         case RS422_CMD_ABORT_ACK:           return "中止应答(3-10)";
+        case RS422_CMD_UPLOAD_NOTIFY:       return "上注通报(0xA207)";
         default:                            return "未知命令";
     }
 }

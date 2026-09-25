@@ -1,13 +1,66 @@
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <unistd.h>
+#include <stdlib.h>
 #include "reset.h"
 #include "msg_handler.h"
 #include "logger.h"
 #include "alarm_manager.h"
 #include "fpga_handler.h"
+#include "config.h"
 
 /* 模块初始化标志 */
 static int g_reset_initialized = 0;
+
+/* ==================== 复位动作的落地开关（可配置） ====================
+ * 改造前的状态：软/硬复位的 system() 都被注释掉，但日志仍打印
+ *   "Service will restart in 2 seconds..." / "System will reboot in 2 seconds..."
+ * 并且真的 sleep(2)，函数最后无条件 return SUCCESS —— BBU 以为已重启并继续
+ * 下发配置，实际什么也没发生，且现场无从察觉。
+ *
+ * 配置项（config/antenna_mgmt.conf）：
+ *   RESET_RESTART_SERVICE  1=软复位后重启本服务（默认）   0=不重启
+ *   RESET_REBOOT_SYSTEM    1=硬复位后重启整个系统         0=不重启（默认）
+ * 整机重启影响面大，默认关闭；需要时按现场约定打开。
+ * ================================================================== */
+static int  g_reset_restart_service = 1;
+static int  g_reset_reboot_system   = 0;
+static bool g_reset_cfg_loaded      = false;
+
+static void reset_cfg_load(void)
+{
+    if (g_reset_cfg_loaded) {
+        return;
+    }
+    g_reset_restart_service = config_get_int("RESET_RESTART_SERVICE", 1);
+    g_reset_reboot_system   = config_get_int("RESET_REBOOT_SYSTEM", 0);
+    g_reset_cfg_loaded = true;
+
+    LOG_INFO("Reset actions config: restart_service=%d, reboot_system=%d",
+             g_reset_restart_service, g_reset_reboot_system);
+}
+
+/* 异步执行重启动作：fork 一个脱离会话的子进程，先睡 2 秒（给北向应答留发送时间），
+ * 再 execvp 执行。不用 shell，也不在消息处理线程里 sleep —— 后者会阻塞 TCP
+ * 接收线程，正是本项目反复踩的那个坑。 */
+static void reset_schedule_action(char *const argv[], const char *what)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        LOG_ERROR("Failed to fork for %s: %s", what, strerror(errno));
+        return;
+    }
+
+    if (pid == 0) {
+        setsid();           /* 脱离会话，父进程重启/退出不影响它 */
+        sleep(2);
+        execvp(argv[0], argv);
+        _exit(127);         /* exec 失败 */
+    }
+
+    LOG_INFO("Scheduled %s in 2 seconds (helper pid=%d)", what, (int)pid);
+}
 
 /**
  * 初始化复位模块
@@ -221,9 +274,10 @@ int handle_reset_indication(const ie_reset_ind_t *ind_ie,
 
     uint32_t reset_type = le32toh(ind_ie->reset_type);
 
-    /* 现阶段仅记录日志，不执行实际业务 */
+    reset_cfg_load();
+
     LOG_INFO("========================================");
-    LOG_INFO("RESET RECEIVED - Echo Mode");
+    LOG_INFO("RESET RECEIVED");
     LOG_INFO("========================================");
     LOG_INFO("Message ID:  %u %s", msg_id,
              msg_id == MSG_RESET_IND ? "(RESET_IND)" : "(REMOTE_RESET_IND)");
@@ -234,42 +288,51 @@ int handle_reset_indication(const ie_reset_ind_t *ind_ie,
     LOG_INFO("  reset_type = 0x%08X (%u)", ind_ie->reset_type, reset_type);
     LOG_INFO("========================================");
 
-    /* 记录警告：实际环境中应执行复位操作 */
     if (reset_type == RESET_TYPE_SOFT) {
-        // LOG_WARN("Soft reset requested but not executed (echo mode)");
-        // LOG_WARN("In production: systemctl restart antenna-mgmt.service");
         LOG_INFO("Executing soft reset (相控阵软复位)");
 
         /* 发送相控阵软复位命令到FPGA */
         int fpga_ret = fpga_send_phase_restore(reset_type);  /* 0表示软复位 */
         if (fpga_ret != SUCCESS) {
-            LOG_ERROR("Failed to send soft reset command to FPGA");
+            /* 关键：FPGA 侧没收到命令就必须如实返回失败，
+             * 否则 BBU 会以为复位已生效并继续下发配置。 */
+            LOG_ERROR("Failed to send soft reset command to FPGA, reset NOT performed");
+            return ERROR_GENERAL;
+        }
+        LOG_INFO("Soft reset command sent to FPGA successfully");
+
+        /* 重启本服务（FPGA 命令已确认下发后才做） */
+        if (g_reset_restart_service) {
+            char *argv[] = { (char *)"systemctl", (char *)"restart",
+                             (char *)"antenna-mgmt.service", NULL };
+            reset_schedule_action(argv, "service restart");
         } else {
-            LOG_INFO("Soft reset command sent to FPGA successfully");
+            LOG_INFO("Service restart disabled by config (RESET_RESTART_SERVICE=0); "
+                     "FPGA soft reset done, management service NOT restarted");
         }
 
-        /* 延迟2秒后重启服务 */
-        LOG_INFO("Service will restart in 2 seconds...");
-        sleep(2);
-        // system("systemctl restart antenna-mgmt.service &");
-
     } else if (reset_type == RESET_TYPE_HARD) {
-        // LOG_WARN("Hard reset requested but not executed (echo mode)");
-        // LOG_WARN("In production: system reboot or hardware power cycle");
-        LOG_INFO("Executing hard reset (相控阵硬复位 + 系统重启)");
+        LOG_INFO("Executing hard reset (相控阵硬复位)");
 
         /* 发送相控阵硬复位命令到FPGA */
         int fpga_ret = fpga_send_phase_restore(reset_type);  /* 1表示硬复位 */
         if (fpga_ret != SUCCESS) {
-            LOG_ERROR("Failed to send hard reset command to FPGA");
+            LOG_ERROR("Failed to send hard reset command to FPGA, reset NOT performed");
+            return ERROR_GENERAL;
+        }
+        LOG_INFO("Hard reset command sent to FPGA successfully");
+
+        /* 重启整个系统（默认关闭：整机重启影响面大） */
+        if (g_reset_reboot_system) {
+            char *argv[] = { (char *)"shutdown", (char *)"-r", (char *)"now", NULL };
+            reset_schedule_action(argv, "system reboot");
         } else {
-            LOG_INFO("Hard reset command sent to FPGA successfully");
+            LOG_INFO("System reboot disabled by config (RESET_REBOOT_SYSTEM=0); "
+                     "FPGA hard reset done, system NOT rebooted");
         }
 
-        /* 延迟2秒后重启系统 */
-        LOG_INFO("System will reboot in 2 seconds...");
-        sleep(2);
-        // system("shutdown -r now &");
+    } else {
+        LOG_WARN("Unknown reset type %u, no action taken", reset_type);
     }
 
     return SUCCESS;

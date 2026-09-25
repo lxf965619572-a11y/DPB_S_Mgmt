@@ -63,14 +63,15 @@ typedef struct {
 typedef struct {
     uint8_t target_id;                              /* 目标标识 */
     uint8_t content[TRANSPARENT_CONTENT_MAX_LEN];   /* 内容数据 */
-    uint16_t content_len;                           /* 实际内容长度 */
+    uint16_t content_len;                           /* IE中内容长度（含补零填充） */
+    uint16_t effective_len;                         /* 有效内容长度（去除尾部补零） */
 } transparent_message_t;
 
 /**
  * 透传消息解析结果（用于日志审计）
  */
 typedef struct {
-    uint16_t msg_id;            /* 消息ID */
+    uint32_t msg_id;            /* 消息ID（32位：与报文头一致，避免截断） */
     char timestamp[32];         /* 时间戳 */
     char source_ip[16];         /* 来源IP */
     int parse_status;           /* 解析状态码: 0=成功, <0=错误码 */
@@ -95,7 +96,7 @@ void transparent_msg_cleanup(void);
  * @param result 解析结果输出
  * @return 成功返回SUCCESS，失败返回错误码
  */
-int transparent_msg_parse(uint16_t msg_id, const uint8_t *payload,
+int transparent_msg_parse(uint32_t msg_id, const uint8_t *payload,
                          uint32_t payload_len, transparent_parse_result_t *result);
 
 /**
@@ -105,7 +106,7 @@ int transparent_msg_parse(uint16_t msg_id, const uint8_t *payload,
  * @param source_ip 来源IP
  * @return 成功返回SUCCESS，失败返回错误码
  */
-int handle_transparent_bbu_to_paau(uint16_t msg_id,
+int handle_transparent_bbu_to_paau(uint32_t msg_id,
                                    const transparent_message_t *trans_msg,
                                    const char *source_ip);
 
@@ -125,7 +126,7 @@ int send_transparent_paau_to_bbu(uint16_t msg_id, uint8_t target_id,
  * @param msg_id 消息ID
  * @return true=是透传消息, false=不是
  */
-bool is_transparent_message(uint16_t msg_id);
+bool is_transparent_message(uint32_t msg_id);
 
 /**
  * 获取透传目标名称

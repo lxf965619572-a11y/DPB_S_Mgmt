@@ -234,7 +234,8 @@ int channel_setup_handle_config(const cpri_message_t *msg)
         memcpy(&ie_type, msg->payload + offset, 2);
         memcpy(&ie_len, msg->payload + offset + 2, 2);
 
-        if (offset + ie_len > msg->payload_len) {
+        /* IE长度包含IE头本身，不能小于IE头长度(4字节)；否则 offset 不推进将导致死循环 */
+        if (ie_len < 4 || offset + ie_len > msg->payload_len) {
             LOG_WARN("Invalid IE length: type=%u, len=%u", ie_type, ie_len);
             break;
         }

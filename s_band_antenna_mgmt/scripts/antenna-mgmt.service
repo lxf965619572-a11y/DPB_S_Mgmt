@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=yt513
+User=root
 Group=root
 
 # 工作目录指向当前版本
@@ -18,8 +18,8 @@ ExecStart=/opt/vendor/current/antenna_mgmt /opt/vendor/config/antenna_mgmt.conf
 # 重启策略
 Restart=always
 RestartSec=10
-StartLimitInterval=300
-StartLimitBurst=5
+StartLimitInterval=0
+StartLimitBurst=0
 
 # 资源限制
 LimitNOFILE=65536

@@ -28,6 +28,12 @@ int tcp_client_init(tcp_client_t *client, const char *server_ip, uint16_t server
         return ERROR_GENERAL;
     }
 
+    if (pthread_mutex_init(&client->send_mutex, NULL) != 0) {
+        LOG_ERROR("Failed to init send mutex");
+        pthread_mutex_destroy(&client->state_mutex);
+        return ERROR_GENERAL;
+    }
+
     LOG_INFO("TCP client initialized: %s:%d", server_ip, server_port);
     return SUCCESS;
 }
@@ -118,6 +124,16 @@ static int tcp_connect_to_server(tcp_client_t *client)
     /* 设置TCP连接状态并清除TCP断开告警 */
     alarm_set_tcp_status(true);
     alarm_clear_tcp_disconnect();
+
+    /* 每次重连都会走到这里，必须先收掉上一个接收线程：
+     * 直接覆盖 client->recv_thread 会让旧 tid 永久丢失（永不 join），
+     * 旧线程还可能在本客户端销毁后继续访问 client。
+     * 断开时接收线程已自行退出（见 tcp_recv_thread 尾部），所以这里是短等待。
+     * 注意：join 时不能持有 state_mutex —— 旧线程的退出路径自己要拿它。 */
+    if (client->recv_thread) {
+        pthread_join(client->recv_thread, NULL);
+        client->recv_thread = 0;
+    }
 
     /* 创建接收线程 */
     if (pthread_create(&client->recv_thread, NULL, tcp_recv_thread, client) != 0) {
@@ -215,9 +231,16 @@ int tcp_client_send(tcp_client_t *client, const uint8_t *data, uint32_t len)
         return ERROR_INVALID_PARAM;
     }
 
+    /* 锁序固定为 send_mutex -> state_mutex（与 tcp_client_stop 一致），避免死锁。
+     * 整个发送过程持 send_mutex：
+     *   1) 多线程并发调用时字节流不会交织（此前 5 个线程可同时写同一 socket）；
+     *   2) sockfd 不会在发送中途被 tcp_client_stop 关闭后复用，写错目标。 */
+    pthread_mutex_lock(&client->send_mutex);
+
     pthread_mutex_lock(&client->state_mutex);
     if (client->state != TCP_STATE_CONNECTED || client->sockfd < 0) {
         pthread_mutex_unlock(&client->state_mutex);
+        pthread_mutex_unlock(&client->send_mutex);
         LOG_ERROR("TCP not connected, cannot send");
         return ERROR_NETWORK;
     }
@@ -230,10 +253,13 @@ int tcp_client_send(tcp_client_t *client, const uint8_t *data, uint32_t len)
         ssize_t ret = send(sockfd, data + sent, len - sent, 0);
         if (ret < 0) {
             LOG_ERROR("Send error: %s", strerror(errno));
+            pthread_mutex_unlock(&client->send_mutex);
             return ERROR_NETWORK;
         }
         sent += (uint32_t)ret;
     }
+
+    pthread_mutex_unlock(&client->send_mutex);
 
     // LOG_DEBUG("Sent %d bytes to BBU", len);
     return SUCCESS;
@@ -260,6 +286,8 @@ int tcp_client_stop(tcp_client_t *client)
 
     client->running = false;
 
+    /* 先取 send_mutex 排空正在进行的 send，再关闭 fd */
+    pthread_mutex_lock(&client->send_mutex);
     pthread_mutex_lock(&client->state_mutex);
     if (client->sockfd >= 0) {
         close(client->sockfd);
@@ -267,13 +295,16 @@ int tcp_client_stop(tcp_client_t *client)
     }
     client->state = TCP_STATE_DISCONNECTED;
     pthread_mutex_unlock(&client->state_mutex);
+    pthread_mutex_unlock(&client->send_mutex);
 
-    /* 等待线程退出 */
+    /* 等待线程退出；join 后清零 tid，避免对同一 tid 二次 join（UB） */
     if (client->recv_thread) {
         pthread_join(client->recv_thread, NULL);
+        client->recv_thread = 0;
     }
     if (client->reconnect_thread) {
         pthread_join(client->reconnect_thread, NULL);
+        client->reconnect_thread = 0;
     }
 
     LOG_INFO("TCP client stopped");
@@ -288,5 +319,6 @@ void tcp_client_destroy(tcp_client_t *client)
 
     tcp_client_stop(client);
     pthread_mutex_destroy(&client->state_mutex);
+    pthread_mutex_destroy(&client->send_mutex);
     LOG_INFO("TCP client destroyed");
 }

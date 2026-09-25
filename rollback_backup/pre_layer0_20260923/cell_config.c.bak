@@ -1,182 +1,20 @@
 #include "cell_config.h"
 #include "fpga_handler.h"
 #include "logger.h"
-#include "tcp_client.h"
 #include <string.h>
-#include <stdlib.h>
 
 /* 全局小区配置管理器 */
 static cell_config_manager_t g_cell_mgr;
 
-/* 全局TCP客户端（定义在 main.c） */
-extern tcp_client_t g_tcp_client;
-
-/* ==================== 频点配置异步执行 ====================
- * wait_for_antenna_mode_cycle() 最长阻塞 5 秒（100ms 轮询）。它原本跑在 TCP
- * 接收线程上，阻塞期间不读 socket → BBU 心跳积压在内核缓冲 → 误判 BBU 失联
- * （现场 25 次心跳超时中 8 次归因于此；实测：改造前接收线程被堵满 5 秒，
- * 期间到达的后续请求全部排队，改造后每条请求都在到达时刻被立即受理）。
- *
- * 这里把整个 MsgID 195 的处理搬到独立 worker 线程：
- *   接收线程只做一次深拷贝入队后立即返回；
- *   worker 在阻塞结束后构造并发出响应。
- * 对 BBU 而言应答内容与时机均不变，只是不再占用接收线程。
- * ======================================================== */
-#define CELL_CFG_JOB_QUEUE_LEN 8
-#define CELL_CFG_RESP_BUF_SIZE 4096
-
-typedef struct {
-    uint8_t  paau_id;
-    uint8_t  bbu_id;
-    uint8_t  port_num;
-    uint32_t serial_num;
-    uint32_t payload_len;
-    uint8_t *payload;   /* 深拷贝：dispatch 返回后原 payload 立刻被还给内存池 */
-} cell_cfg_job_t;
-
-/* g_cell_mgr.mutex 是否处于"已初始化且未销毁"状态。
- * 必要性：init 在 worker 创建失败时会销毁该 mutex 再返回失败，
- * 而 main.c 的清理仍会无条件调用 cell_config_destroy() → 二次 destroy（UB）。 */
-static bool g_cell_mgr_mutex_ready = false;
-
-static cell_cfg_job_t  *g_job_queue[CELL_CFG_JOB_QUEUE_LEN];
-static int              g_job_head = 0;
-static int              g_job_tail = 0;
-static int              g_job_count = 0;
-static pthread_mutex_t  g_job_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t   g_job_cond  = PTHREAD_COND_INITIALIZER;
-static pthread_t        g_job_thread;
-static bool             g_job_thread_valid = false;
-static bool             g_job_thread_stop  = false;
-
-static void cell_cfg_job_free(cell_cfg_job_t *job)
-{
-    if (job) {
-        free(job->payload);
-        free(job);
-    }
-}
-
-/* worker 线程：取作业 → 执行会阻塞的处理 → 发出响应 */
-static void *cell_cfg_worker(void *arg)
-{
-    (void)arg;
-
-    for (;;) {
-        pthread_mutex_lock(&g_job_mutex);
-        while (g_job_count == 0 && !g_job_thread_stop) {
-            pthread_cond_wait(&g_job_cond, &g_job_mutex);
-        }
-        if (g_job_count == 0 && g_job_thread_stop) {
-            pthread_mutex_unlock(&g_job_mutex);
-            break;
-        }
-
-        cell_cfg_job_t *job = g_job_queue[g_job_head];
-        g_job_queue[g_job_head] = NULL;
-        g_job_head = (g_job_head + 1) % CELL_CFG_JOB_QUEUE_LEN;
-        g_job_count--;
-        pthread_mutex_unlock(&g_job_mutex);
-
-        /* 用深拷贝的数据重建只读请求视图，复用原有的响应构造逻辑 */
-        cpri_message_t request;
-        memset(&request, 0, sizeof(request));
-        request.header.msg_id     = MSG_NR_CELL_CONFIG;
-        request.header.paau_id    = job->paau_id;
-        request.header.bbu_id     = job->bbu_id;
-        request.header.port_num   = job->port_num;
-        request.header.serial_num = job->serial_num;
-        request.payload           = job->payload;
-        request.payload_len       = job->payload_len;
-
-        cpri_message_t response;
-        if (cell_config_create_response(&response, &request) == SUCCESS) {
-            uint8_t buffer[CELL_CFG_RESP_BUF_SIZE];
-            int len = cpri_encode_message(&response, buffer, sizeof(buffer));
-            if (len > 0) {
-                tcp_client_send(&g_tcp_client, buffer, len);
-                LOG_INFO("Sent cell config response (serial_num=%u)", response.header.serial_num);
-            } else {
-                LOG_ERROR("Failed to encode cell config response (serial=%u)", job->serial_num);
-            }
-            cpri_free_message(&response);
-        } else {
-            LOG_ERROR("Failed to create cell config response (serial=%u)", job->serial_num);
-        }
-
-        cell_cfg_job_free(job);
-    }
-
-    LOG_INFO("Cell config worker thread exited");
-    return NULL;
-}
-
-/* 接收线程调用：深拷贝请求并入队，立即返回（不阻塞） */
-int cell_config_submit_request(const cpri_message_t *msg)
-{
-    if (!msg) {
-        return ERROR_INVALID_PARAM;
-    }
-
-    cell_cfg_job_t *job = (cell_cfg_job_t *)calloc(1, sizeof(cell_cfg_job_t));
-    if (!job) {
-        LOG_ERROR("Failed to alloc cell cfg job");
-        return ERROR_GENERAL;
-    }
-
-    job->paau_id     = msg->header.paau_id;
-    job->bbu_id      = msg->header.bbu_id;
-    job->port_num    = msg->header.port_num;
-    job->serial_num  = msg->header.serial_num;
-    job->payload_len = msg->payload_len;
-
-    if (msg->payload_len > 0 && msg->payload) {
-        job->payload = (uint8_t *)malloc(msg->payload_len);
-        if (!job->payload) {
-            LOG_ERROR("Failed to alloc job payload (%u bytes)", msg->payload_len);
-            free(job);
-            return ERROR_GENERAL;
-        }
-        memcpy(job->payload, msg->payload, msg->payload_len);
-    }
-
-    pthread_mutex_lock(&g_job_mutex);
-    if (g_job_count >= CELL_CFG_JOB_QUEUE_LEN) {
-        pthread_mutex_unlock(&g_job_mutex);
-        LOG_ERROR("Cell cfg job queue full, request dropped (serial=%u)", job->serial_num);
-        cell_cfg_job_free(job);
-        return ERROR_GENERAL;
-    }
-    g_job_queue[g_job_tail] = job;
-    g_job_tail = (g_job_tail + 1) % CELL_CFG_JOB_QUEUE_LEN;
-    g_job_count++;
-    pthread_cond_signal(&g_job_cond);
-    pthread_mutex_unlock(&g_job_mutex);
-
-    LOG_INFO("Cell config request queued (serial=%u, payload_len=%u)",
-             job->serial_num, job->payload_len);
-    return SUCCESS;
-}
-
 /**
- * 检查是否有任何已下发到天线并生效的频点
- * 返回：true = 有，false = 没有
- *
- * 注意：不能用 cells[].freq_count 判断——它把因天线模式不对而仅本地留存、
- * 从未下发的频点也计入了。若据此开启发射，会出现天线侧已无有效频点、
- * 发射却仍被这些"僵尸记录"支撑着不关的情况。这里只认 sent_to_antenna。
+ * 检查是否有任何小区包含频点
+ * 返回：true = 有频点，false = 没有频点
  */
 static bool has_any_freq(void)
 {
     for (int i = 0; i < MAX_CELLS; i++) {
-        if (!g_cell_mgr.cells[i].active) {
-            continue;
-        }
-        for (int j = 0; j < MAX_FREQS_PER_CELL; j++) {
-            if (g_cell_mgr.freqs[i][j].active &&
-                g_cell_mgr.freqs[i][j].sent_to_antenna) {
-                return true;
-            }
+        if (g_cell_mgr.cells[i].active && g_cell_mgr.cells[i].freq_count > 0) {
+            return true;
         }
     }
     return false;
@@ -217,20 +55,6 @@ int cell_config_init(void)
         LOG_ERROR("Failed to init cell config mutex");
         return ERROR_GENERAL;
     }
-    g_cell_mgr_mutex_ready = true;
-
-    /* 启动异步 worker：把 5 秒模式校验移出 TCP 接收线程 */
-    g_job_head = 0;
-    g_job_tail = 0;
-    g_job_count = 0;
-    g_job_thread_stop = false;
-    if (pthread_create(&g_job_thread, NULL, cell_cfg_worker, NULL) != 0) {
-        LOG_ERROR("Failed to create cell config worker thread");
-        pthread_mutex_destroy(&g_cell_mgr.mutex);
-        g_cell_mgr_mutex_ready = false;   /* 已销毁，cleanup 不得再销毁一次 */
-        return ERROR_GENERAL;
-    }
-    g_job_thread_valid = true;
 
     LOG_INFO("Cell config manager initialized");
     return SUCCESS;
@@ -374,7 +198,6 @@ int cell_config_apply_cell(const cell_config_ie_t *cell_cfg, uint32_t *result)
                 /* 删除该小区的所有频点 */
                 for (int i = 0; i < MAX_FREQS_PER_CELL; i++) {
                     g_cell_mgr.freqs[cell_idx][i].active = false;
-                    g_cell_mgr.freqs[cell_idx][i].sent_to_antenna = false;
                 }
                 g_cell_mgr.cells[cell_idx].freq_count = 0;  /* 重置频点计数 */
                 g_cell_mgr.cells[cell_idx].active = false;
@@ -490,26 +313,6 @@ static int wait_for_antenna_mode_cycle(void)
     return SUCCESS;
 }
 
-/**
- * 把频点配置写入本地管理结构
- * sent_to_antenna：本次写入的参数是否已经真正下发到天线并验证通过。
- *   true  - 记录可用于后续查重（认为天线侧已是该配置）
- *   false - 仅本地留存（天线模式不对、下发失败等），查重时必须忽略，
- *           否则 BBU 重发同一条频点配置会被误判为"已配好"而跳过下发
- */
-static void store_freq_info(freq_info_t *slot, const freq_config_ie_t *freq_cfg, bool sent_to_antenna)
-{
-    slot->active = true;
-    slot->sent_to_antenna = sent_to_antenna;
-    slot->local_cell_id = freq_cfg->local_cell_id;
-    slot->beam_id = freq_cfg->beam_id;
-    slot->dl_center_freq = freq_cfg->dl_center_freq;
-    slot->ul_center_freq = freq_cfg->ul_center_freq;
-    slot->beam_bandwidth = freq_cfg->beam_bandwidth;
-    slot->ul_dl_config = freq_cfg->ul_dl_config;
-    slot->special_subframe = freq_cfg->special_subframe;
-}
-
 /* 应用频点配置 */
 int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
 {
@@ -597,16 +400,18 @@ int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
 
                 /* 保存频点配置（即使不发送到天线） */
                 if (freq_idx >= 0) {
-                    /* 标记为未下发：天线模式不对，参数只存在本地，
-                     * 后续 BBU 重发时必须重新下发，不能被查重跳过 */
-                    store_freq_info(&g_cell_mgr.freqs[cell_idx][freq_idx], freq_cfg, false);
+                    g_cell_mgr.freqs[cell_idx][freq_idx].active = true;
+                    g_cell_mgr.freqs[cell_idx][freq_idx].local_cell_id = freq_cfg->local_cell_id;
+                    g_cell_mgr.freqs[cell_idx][freq_idx].beam_id = freq_cfg->beam_id;
+                    g_cell_mgr.freqs[cell_idx][freq_idx].dl_center_freq = freq_cfg->dl_center_freq;
+                    g_cell_mgr.freqs[cell_idx][freq_idx].ul_center_freq = freq_cfg->ul_center_freq;
+                    g_cell_mgr.freqs[cell_idx][freq_idx].beam_bandwidth = freq_cfg->beam_bandwidth;
+                    g_cell_mgr.freqs[cell_idx][freq_idx].ul_dl_config = freq_cfg->ul_dl_config;
+                    g_cell_mgr.freqs[cell_idx][freq_idx].special_subframe = freq_cfg->special_subframe;
 
                     LOG_INFO("Freq saved locally (not sent): cell=%u, beam=%u, dl=%u kHz, ul=%u kHz, bw=%u",
                              freq_cfg->local_cell_id, freq_cfg->beam_id,
                              freq_cfg->dl_center_freq, freq_cfg->ul_center_freq, freq_cfg->beam_bandwidth);
-                } else {
-                    LOG_ERROR("No free freq slot for cell %u (mode check failed)",
-                              freq_cfg->local_cell_id);
                 }
 
                 /* 统一返回失败 */
@@ -617,20 +422,15 @@ int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
             /* 步骤2：工作模式正确，检查是否需要发送到天线 */
             bool need_send_to_antenna = true;
 
-            /* 本小区范围内查重：查找是否已有频点使用相同的频率配置。
-             * 只把 sent_to_antenna 为 true 的记录算作重复——
-             * 之前因模式不对而仅本地留存、从未下发的记录，其参数并不代表
-             * 天线侧的真实状态，若计入查重会导致本次重发被误判为"已配好"
-             * 而跳过下发，最终 BBU 认为成功、天线却没有该频点。 */
+            /* 全局检查：查找是否已有任何频点使用相同的频率配置 */
             for (int i = 0; i < MAX_FREQS_PER_CELL; i++) {
                 if (g_cell_mgr.freqs[cell_idx][i].active &&
-                    g_cell_mgr.freqs[cell_idx][i].sent_to_antenna &&
                     g_cell_mgr.freqs[cell_idx][i].dl_center_freq == freq_cfg->dl_center_freq &&
                     g_cell_mgr.freqs[cell_idx][i].ul_center_freq == freq_cfg->ul_center_freq &&
                     g_cell_mgr.freqs[cell_idx][i].beam_bandwidth == freq_cfg->beam_bandwidth) {
-                    /* 找到相同的频率配置且已下发到天线，无需重复发送 */
+                    /* 找到相同的频率配置，无需发送到天线 */
                     need_send_to_antenna = false;
-                    LOG_INFO("Freq beam=%u has same config as already-sent beam=%u (DL=%u, UL=%u, BW=%u), skip antenna command",
+                    LOG_INFO("Freq beam=%u has same config as existing beam=%u (DL=%u, UL=%u, BW=%u), skip antenna command",
                              freq_cfg->beam_id,
                              g_cell_mgr.freqs[cell_idx][i].beam_id,
                              freq_cfg->dl_center_freq,
@@ -675,10 +475,15 @@ int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
                 }
             }
 
-            /* 步骤4：保存频点配置到本地管理结构
-             * 此处统一按"未下发"记录，只有下面确认天线侧生效后才置
-             * sent_to_antenna，避免下发失败或模式验证超时时留下脏记录 */
-            store_freq_info(&g_cell_mgr.freqs[cell_idx][freq_idx], freq_cfg, false);
+            /* 步骤4：保存频点配置到本地管理结构 */
+            g_cell_mgr.freqs[cell_idx][freq_idx].active = true;
+            g_cell_mgr.freqs[cell_idx][freq_idx].local_cell_id = freq_cfg->local_cell_id;
+            g_cell_mgr.freqs[cell_idx][freq_idx].beam_id = freq_cfg->beam_id;
+            g_cell_mgr.freqs[cell_idx][freq_idx].dl_center_freq = freq_cfg->dl_center_freq;
+            g_cell_mgr.freqs[cell_idx][freq_idx].ul_center_freq = freq_cfg->ul_center_freq;
+            g_cell_mgr.freqs[cell_idx][freq_idx].beam_bandwidth = freq_cfg->beam_bandwidth;
+            g_cell_mgr.freqs[cell_idx][freq_idx].ul_dl_config = freq_cfg->ul_dl_config;
+            g_cell_mgr.freqs[cell_idx][freq_idx].special_subframe = freq_cfg->special_subframe;
 
             LOG_INFO("Freq configured: cell=%u, beam=%u, dl=%u kHz, ul=%u kHz, bw=%u",
                      freq_cfg->local_cell_id, freq_cfg->beam_id,
@@ -693,7 +498,6 @@ int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
                 if (ret != SUCCESS) {
                     LOG_ERROR("Failed to send freq/band to FPGA");
                     *result = CONFIG_RESULT_FAILURE;
-                    /* sent_to_antenna 保持 false，BBU 重发时会重新下发 */
                 } else {
                     LOG_INFO("Sent freq/band to antenna: DL=%u kHz, UL=%u kHz, BW=%u (mode=%u)",
                              freq_cfg->dl_center_freq, freq_cfg->ul_center_freq,
@@ -704,62 +508,27 @@ int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
 
                     /* 等待并验证天线工作模式切换 */
                     int mode_check_ret = wait_for_antenna_mode_cycle();
-
-                    /* 重新加锁以保持函数退出时的锁状态一致 */
-                    pthread_mutex_lock(&g_cell_mgr.mutex);
-
-                    /* 等待期间锁被释放，小区和频点槽位可能已被其他线程
-                     * 删除或复用，必须重新定位后再置位，否则会误标到别的频点 */
-                    int cur_cell_idx = -1;
-                    for (int i = 0; i < MAX_CELLS; i++) {
-                        if (g_cell_mgr.cells[i].active &&
-                            g_cell_mgr.cells[i].local_cell_id == freq_cfg->local_cell_id) {
-                            cur_cell_idx = i;
-                            break;
-                        }
-                    }
-
-                    int cur_freq_idx = -1;
-                    if (cur_cell_idx >= 0) {
-                        for (int i = 0; i < MAX_FREQS_PER_CELL; i++) {
-                            freq_info_t *f = &g_cell_mgr.freqs[cur_cell_idx][i];
-                            if (f->active && f->beam_id == freq_cfg->beam_id &&
-                                f->dl_center_freq == freq_cfg->dl_center_freq &&
-                                f->ul_center_freq == freq_cfg->ul_center_freq &&
-                                f->beam_bandwidth == freq_cfg->beam_bandwidth) {
-                                cur_freq_idx = i;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (cur_freq_idx < 0) {
-                        /* 等待期间配置已被改动，本次结果作废，交由 BBU 重发 */
-                        LOG_WARN("Cell %u beam %u changed during mode wait, discard this result",
-                                 freq_cfg->local_cell_id, freq_cfg->beam_id);
-                        *result = CONFIG_RESULT_FAILURE;
-                    } else if (mode_check_ret != SUCCESS) {
+                    if (mode_check_ret != SUCCESS) {
                         LOG_ERROR("Antenna work mode cycle verification failed");
                         *result = CONFIG_RESULT_FAILURE;
-                        /* sent_to_antenna 保持 false，BBU 重发时会重新下发 */
+
+                        /* 重新加锁以保持函数退出时的锁状态一致 */
+                        pthread_mutex_lock(&g_cell_mgr.mutex);
                     } else {
-                        /* 天线侧已确认生效，标记该记录可用于后续查重 */
-                        g_cell_mgr.freqs[cur_cell_idx][cur_freq_idx].sent_to_antenna = true;
+                        /* 模式切换验证成功 */
                         *result = CONFIG_RESULT_SUCCESS;
+
+                        /* 重新加锁以保持函数退出时的锁状态一致 */
+                        pthread_mutex_lock(&g_cell_mgr.mutex);
 
                         /* 检查全局频点状态并更新发射控制 */
                         update_tx_control();
                     }
                 }
             } else {
-                /* 命中同小区内一条已下发的同参数记录。天线侧的频段配置是全局的
-                 * （fpga_send_freq_band 不区分 beam_id），说明天线当前就是这组参数，
-                 * 因此本条记录同样标记为已下发 */
-                g_cell_mgr.freqs[cell_idx][freq_idx].sent_to_antenna = true;
-                *result = CONFIG_RESULT_SUCCESS;
-
                 /* 配置相同且工作模式正确，无需等待模式切换，直接更新发射控制 */
                 update_tx_control();
+                *result = CONFIG_RESULT_SUCCESS;
             }
 
             break;
@@ -769,7 +538,6 @@ int cell_config_apply_freq(const freq_config_ie_t *freq_cfg, uint32_t *result)
             /* 删除频点 */
             if (freq_idx >= 0) {
                 g_cell_mgr.freqs[cell_idx][freq_idx].active = false;
-                g_cell_mgr.freqs[cell_idx][freq_idx].sent_to_antenna = false;
                 g_cell_mgr.cells[cell_idx].freq_count--;
                 LOG_INFO("Freq deleted: cell=%u, beam=%u", freq_cfg->local_cell_id, freq_cfg->beam_id);
 
@@ -863,8 +631,7 @@ int cell_config_create_response(cpri_message_t *response, const cpri_message_t *
         memcpy(&ie_type, request->payload + req_offset, 2);
         memcpy(&ie_len, request->payload + req_offset + 2, 2);
 
-        /* IE长度包含IE头本身，不能小于IE头长度(4字节)；否则 offset 不推进将导致死循环 */
-        if (ie_len < 4 || req_offset + ie_len > request->payload_len) {
+        if (req_offset + ie_len > request->payload_len) {
             break;
         }
 
@@ -928,29 +695,6 @@ int cell_config_handle_request(const cpri_message_t *msg)
 /* 销毁小区配置管理器 */
 void cell_config_destroy(void)
 {
-    /* 必须先停 worker 并 join，否则它可能在 mutex 销毁后仍访问全局状态与 g_tcp_client。
-     * join 最长等待一次模式校验（5 秒），有界。 */
-    if (g_job_thread_valid) {
-        pthread_mutex_lock(&g_job_mutex);
-        g_job_thread_stop = true;
-        pthread_cond_signal(&g_job_cond);
-        pthread_mutex_unlock(&g_job_mutex);
-
-        pthread_join(g_job_thread, NULL);
-        g_job_thread = 0;
-        g_job_thread_valid = false;
-
-        /* 释放队列中尚未处理的作业 */
-        for (int i = 0; i < CELL_CFG_JOB_QUEUE_LEN; i++) {
-            cell_cfg_job_free(g_job_queue[i]);
-            g_job_queue[i] = NULL;
-        }
-        g_job_count = 0;
-    }
-
-    if (g_cell_mgr_mutex_ready) {
-        pthread_mutex_destroy(&g_cell_mgr.mutex);
-        g_cell_mgr_mutex_ready = false;
-    }
+    pthread_mutex_destroy(&g_cell_mgr.mutex);
     LOG_INFO("Cell config manager destroyed");
 }

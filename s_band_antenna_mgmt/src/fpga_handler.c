@@ -9,6 +9,10 @@ fpga_state_manager_t g_fpga_state;
 /* 外部UART客户端引用（在main.c中定义） */
 extern uart_client_t g_uart_client;
 
+/* g_fpga_state.status_mutex 是否处于"已初始化且未销毁"状态，
+ * 使 destroy 在 init 失败（或未调用 init）时也安全。 */
+static bool g_fpga_status_mutex_ready = false;
+
 int fpga_handler_init(void)
 {
     memset(&g_fpga_state, 0, sizeof(g_fpga_state));
@@ -18,6 +22,7 @@ int fpga_handler_init(void)
         LOG_ERROR("Failed to init FPGA state mutex");
         return ERROR_GENERAL;
     }
+    g_fpga_status_mutex_ready = true;
 
     LOG_INFO("FPGA handler initialized");
     return SUCCESS;
@@ -326,6 +331,64 @@ int fpga_send_tx_control(uint8_t tx_enable)
     return ERROR_GENERAL;
 }
 
+/* 发送透传数据 */
+int fpga_send_passthrough(const uint8_t *data, uint32_t data_len)
+{
+    if (!data || data_len == 0) {
+        LOG_ERROR("Invalid passthrough data: data=%p, len=%u", data, data_len);
+        return ERROR_INVALID_PARAM;
+    }
+
+    /* 检查数据长度是否合理（422协议限制） */
+    if (data_len > 255) {
+        LOG_ERROR("Passthrough data too large: %u bytes (max 255)", data_len);
+        return ERROR_INVALID_PARAM;
+    }
+
+    fpga_message_t msg;
+    msg.msg_id = FPGA_MSG_PASSTHROUGH;
+    msg.payload = (uint8_t*)data;
+    msg.payload_len = data_len;
+
+    /* 分配足够大的缓冲区：帧头(2) + 消息ID(1) + 长度(1) + 数据(N) + 帧尾(2) */
+    uint8_t buffer[512];
+    int len = fpga_encode_message(&msg, buffer, sizeof(buffer));
+    if (len > 0) {
+        LOG_INFO("Sending passthrough data: %u bytes", data_len);
+        LOG_DEBUG("Passthrough data hex: %02X %02X %02X %02X ...",
+                  data[0],
+                  data_len > 1 ? data[1] : 0,
+                  data_len > 2 ? data[2] : 0,
+                  data_len > 3 ? data[3] : 0);
+        return uart_client_send(&g_uart_client, buffer, len);
+    }
+
+    return ERROR_GENERAL;
+}
+
+/* 发送原始数据到FPGA（不加FPGA帧封装，用于透传内容转发） */
+/* 透传直写 FPGA 的长度上界，与透传 IE 的内容上限（TRANSPARENT_CONTENT_MAX_LEN）一致。
+ * 本路径不做 FPGA 帧封装：没有命令码、没有长度字段、没有帧尾校验，
+ * 内容原样 write 到 RS-422。因此长度必须在这里设上界，不能依赖调用方自觉
+ * （同类函数 fpga_send_passthrough 已有 255 字节上界，此处原先一个都没有）。 */
+#define FPGA_RAW_MAX_LEN    1024
+
+int fpga_send_raw(const uint8_t *data, uint32_t data_len)
+{
+    if (!data || data_len == 0) {
+        LOG_ERROR("Invalid raw data for FPGA: data=%p, len=%u", data, data_len);
+        return ERROR_INVALID_PARAM;
+    }
+
+    if (data_len > FPGA_RAW_MAX_LEN) {
+        LOG_ERROR("Raw FPGA data too large: %u bytes (max %u)", data_len, FPGA_RAW_MAX_LEN);
+        return ERROR_INVALID_PARAM;
+    }
+
+    LOG_INFO("Sending raw data to FPGA: %u bytes", data_len);
+    return uart_client_send(&g_uart_client, data, data_len);
+}
+
 /* 设置CPRI工作模式 (用于参数配置) */
 int fpga_handler_set_work_mode(uint32_t work_mode)
 {
@@ -334,6 +397,10 @@ int fpga_handler_set_work_mode(uint32_t work_mode)
 
 void fpga_handler_destroy(void)
 {
-    pthread_mutex_destroy(&g_fpga_state.status_mutex);
+    /* 只在 mutex 确实初始化过时才销毁，避免 init 失败路径上的二次/无效 destroy */
+    if (g_fpga_status_mutex_ready) {
+        pthread_mutex_destroy(&g_fpga_state.status_mutex);
+        g_fpga_status_mutex_ready = false;
+    }
     LOG_INFO("FPGA handler destroyed");
 }

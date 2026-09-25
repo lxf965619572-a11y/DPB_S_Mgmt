@@ -27,6 +27,8 @@ typedef enum {
     FPGA_MSG_SYSTEM_TIME = 0x0A,        /* 系统时间 */
     FPGA_MSG_TX_CONTROL = 0x0B,         /* 发射控制 */
     FPGA_MSG_POWER_OFF_ACK = 0x0D,      /* 断电应答 */
+    FPGA_MSG_LOG_QUERY = 0x11,          /* 日志查询 */
+    FPGA_MSG_PASSTHROUGH = 0x12,        /* 透传数据 */
     FPGA_MSG_STATUS_QUERY = 0xFF,       /* 状态检询 */
 } fpga_msg_id_t;
 

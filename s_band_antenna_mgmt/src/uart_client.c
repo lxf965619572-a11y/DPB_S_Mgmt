@@ -106,6 +106,7 @@ int uart_client_open(uart_client_t *client)
         LOG_ERROR("Failed to create UART poll thread");
         client->running = false;
         pthread_join(client->recv_thread, NULL);
+        client->recv_thread = 0;   /* 清零：否则后续 close 会对同一 tid 二次 join */
         pthread_attr_destroy(&attr);
         close(client->fd);
         client->fd = -1;
@@ -381,12 +382,16 @@ int uart_client_close(uart_client_t *client)
     }
     client->state = UART_STATE_CLOSED;
 
-    /* 等待线程退出 */
+    /* 等待线程退出；join 后清零 tid，使本函数可安全重复调用。
+     * main.c 的清理顺序是 uart_client_close() → uart_client_destroy()，
+     * 而 destroy 内部又会调一次 close —— 不清零就是对同一 tid 二次 join（UB）。 */
     if (client->recv_thread) {
         pthread_join(client->recv_thread, NULL);
+        client->recv_thread = 0;
     }
     if (client->poll_thread) {
         pthread_join(client->poll_thread, NULL);
+        client->poll_thread = 0;
     }
 
     LOG_INFO("UART device closed");

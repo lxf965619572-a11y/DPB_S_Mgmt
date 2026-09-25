@@ -19,6 +19,80 @@
 /* 外部TCP客户端引用 */
 extern tcp_client_t g_tcp_client;
 
+/* ==================== 入站报文身份校验（可配置） ====================
+ * 背景：改造前全项目没有任何一处校验入站报文的身份字段，北向链路上任何能冒充
+ * BBU 端点（BBU_IP:BBU_PORT）的主机都能下发复位、上注、透传写 FPGA 等指令。
+ *
+ * 但校验必须与 BBU 侧实际下发的取值对齐，否则一加就直接断链。因此做成三档配置，
+ * **默认是"仅记录、不拒绝"**：先跑一段时间看日志里 BBU 到底发的什么值，确认无误
+ * 再切到"拒绝"。
+ *
+ * 配置项（config/antenna_mgmt.conf）：
+ *   PAAU_ID           本地 PAAU 标识              默认 0
+ *   PAAU_ID_CHECK     0=关闭 1=仅记录 2=拒绝      默认 1
+ *   PAAU_ID_BROADCAST 广播值，等于它一律受理      默认 255
+ * ================================================================ */
+typedef enum {
+    PAAU_ID_CHECK_OFF     = 0,  /* 不校验，与改造前行为一致 */
+    PAAU_ID_CHECK_WARN    = 1,  /* 不匹配只打 WARN，仍受理 */
+    PAAU_ID_CHECK_ENFORCE = 2   /* 不匹配直接丢弃 */
+} paau_id_check_mode_t;
+
+static int      g_paau_id_local       = 0;
+static int      g_paau_id_broadcast   = 255;
+static int      g_paau_id_check_mode  = PAAU_ID_CHECK_WARN;
+static bool     g_paau_id_cfg_loaded  = false;
+static uint32_t g_paau_id_mismatch_count = 0;
+
+static void paau_id_cfg_load(void)
+{
+    if (g_paau_id_cfg_loaded) {
+        return;
+    }
+
+    g_paau_id_local      = config_get_int("PAAU_ID", 0);
+    g_paau_id_broadcast  = config_get_int("PAAU_ID_BROADCAST", 255);
+    g_paau_id_check_mode = config_get_int("PAAU_ID_CHECK", PAAU_ID_CHECK_WARN);
+
+    if (g_paau_id_check_mode < PAAU_ID_CHECK_OFF ||
+        g_paau_id_check_mode > PAAU_ID_CHECK_ENFORCE) {
+        LOG_WARN("Invalid PAAU_ID_CHECK=%d, falling back to 1 (warn only)",
+                 g_paau_id_check_mode);
+        g_paau_id_check_mode = PAAU_ID_CHECK_WARN;
+    }
+
+    g_paau_id_cfg_loaded = true;
+    LOG_INFO("Inbound paau_id check: mode=%d (0=off 1=warn 2=reject), local=%d, broadcast=%d",
+             g_paau_id_check_mode, g_paau_id_local, g_paau_id_broadcast);
+}
+
+/* 返回 true 表示应当受理该报文 */
+static bool paau_id_accept(uint8_t inbound_id)
+{
+    paau_id_cfg_load();
+
+    if (g_paau_id_check_mode == PAAU_ID_CHECK_OFF) {
+        return true;
+    }
+    if (g_paau_id_broadcast >= 0 && g_paau_id_broadcast <= 255 &&
+        inbound_id == (uint8_t)g_paau_id_broadcast) {
+        return true;
+    }
+    if (inbound_id == (uint8_t)g_paau_id_local) {
+        return true;
+    }
+
+    g_paau_id_mismatch_count++;
+    /* 限流：前 20 次逐条告警，之后每 1000 次一条，避免日志被刷爆 */
+    if (g_paau_id_mismatch_count <= 20 || (g_paau_id_mismatch_count % 1000) == 0) {
+        LOG_WARN("Inbound paau_id=%u does not match local=%d (broadcast=%d), mismatches=%u",
+                 inbound_id, g_paau_id_local, g_paau_id_broadcast,
+                 g_paau_id_mismatch_count);
+    }
+
+    return (g_paau_id_check_mode != PAAU_ID_CHECK_ENFORCE);
+}
+
 /* 消息处理函数指针类型 */
 typedef int (*msg_handler_func_t)(const cpri_message_t *msg);
 
@@ -53,9 +127,51 @@ int msg_handler_init(void)
     return SUCCESS;
 }
 
+/* ==================== 入站 msg_id 白名单 ====================
+ * 只接受分发表里已登记的消息类型，以及透传区间 221-240。
+ *
+ * 顺带修掉一处截断：msg_id 在报文头里是 uint32_t，而透传判定的形参原先是 uint16_t，
+ * 于是 msg_id = 0x10000 + 221 这类构造会被截断成 221 而被【误路由进透传分支】。
+ * 实测（基线二进制）：msg_id=65757 会打出 "Handle transparent message"。
+ *
+ * 定级说明：该误路由【不会】直达 FPGA 写操作——透传处理内部的方向判定用的是完整
+ * 32 位值，65757 会落到 "unexpected direction" 分支后返回。任何能通过方向判定的值
+ * 本身就已落在 [231,240] 内，截断与否结果相同。所以这是路由缺陷，不是写权限绕过；
+ * 但仍应由白名单在入口处挡掉，且透传判据理应与报文头类型保持一致。
+ * ========================================================== */
+static bool msg_id_is_accepted(uint32_t msg_id)
+{
+    if (is_transparent_message(msg_id)) {
+        return true;
+    }
+    for (int i = 0; g_msg_handlers[i].handler != NULL; i++) {
+        if (g_msg_handlers[i].msg_id == msg_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int msg_handler_dispatch(const cpri_message_t *msg)
 {
     if (!msg) {
+        return ERROR_INVALID_PARAM;
+    }
+
+    /* 入站 msg_id 白名单 */
+    if (!msg_id_is_accepted(msg->header.msg_id)) {
+        LOG_WARN("Rejected unknown msg_id=%u (serial=%u)",
+                 msg->header.msg_id, msg->header.serial_num);
+        return ERROR_INVALID_PARAM;
+    }
+
+    /* 入站身份校验（可配置，默认仅记录不拒绝）。放在分发之前，
+     * 使透传消息（221-240，会裸写 FPGA）也一并纳入校验。 */
+    if (!paau_id_accept(msg->header.paau_id)) {
+        LOG_ERROR("Message DROPPED: paau_id=%u not accepted (msg=%s, serial=%u)",
+                  msg->header.paau_id,
+                  cpri_get_msg_type_name(msg->header.msg_id),
+                  msg->header.serial_num);
         return ERROR_INVALID_PARAM;
     }
 
@@ -227,30 +343,16 @@ int handle_cell_config(const cpri_message_t *msg)
 {
     LOG_INFO("Handle NR cell config");
 
-    /* 处理小区配置请求 */
-    int ret = cell_config_handle_request(msg);
+    /* 交给 cell_config 的 worker 线程处理：
+     * 频点配置需要等待最长 5 秒的天线模式校验，不能阻塞 TCP 接收线程
+     * （阻塞期间不读 socket 会把 BBU 心跳堵在内核缓冲，误判 BBU 失联）。
+     * 响应由 worker 在校验结束后发出，对 BBU 而言内容与时机不变。 */
+    int ret = cell_config_submit_request(msg);
     if (ret != SUCCESS) {
-        LOG_ERROR("Failed to handle cell config request");
+        LOG_ERROR("Failed to submit cell config request");
         return ret;
     }
 
-    /* 生成小区配置响应 */
-    cpri_message_t response;
-    ret = cell_config_create_response(&response, msg);
-    if (ret != SUCCESS) {
-        LOG_ERROR("Failed to create cell config response");
-        return ret;
-    }
-
-    /* 编码并发送响应 */
-    uint8_t buffer[4096];
-    int len = cpri_encode_message(&response, buffer, sizeof(buffer));
-    if (len > 0) {
-        tcp_client_send(&g_tcp_client, buffer, len);
-        LOG_INFO("Sent cell config response (serial_num=%u)", response.header.serial_num);
-    }
-
-    cpri_free_message(&response);
     return SUCCESS;
 }
 

@@ -1,162 +1,10 @@
 #include "cell_config.h"
 #include "fpga_handler.h"
 #include "logger.h"
-#include "tcp_client.h"
 #include <string.h>
-#include <stdlib.h>
 
 /* 全局小区配置管理器 */
 static cell_config_manager_t g_cell_mgr;
-
-/* 全局TCP客户端（定义在 main.c） */
-extern tcp_client_t g_tcp_client;
-
-/* ==================== 频点配置异步执行 ====================
- * wait_for_antenna_mode_cycle() 最长阻塞 5 秒（100ms 轮询）。它原本跑在 TCP
- * 接收线程上，阻塞期间不读 socket → BBU 心跳积压在内核缓冲 → 误判 BBU 失联
- * （现场 25 次心跳超时中 8 次归因于此；实测：改造前接收线程被堵满 5 秒，
- * 期间到达的后续请求全部排队，改造后每条请求都在到达时刻被立即受理）。
- *
- * 这里把整个 MsgID 195 的处理搬到独立 worker 线程：
- *   接收线程只做一次深拷贝入队后立即返回；
- *   worker 在阻塞结束后构造并发出响应。
- * 对 BBU 而言应答内容与时机均不变，只是不再占用接收线程。
- * ======================================================== */
-#define CELL_CFG_JOB_QUEUE_LEN 8
-#define CELL_CFG_RESP_BUF_SIZE 4096
-
-typedef struct {
-    uint8_t  paau_id;
-    uint8_t  bbu_id;
-    uint8_t  port_num;
-    uint32_t serial_num;
-    uint32_t payload_len;
-    uint8_t *payload;   /* 深拷贝：dispatch 返回后原 payload 立刻被还给内存池 */
-} cell_cfg_job_t;
-
-/* g_cell_mgr.mutex 是否处于"已初始化且未销毁"状态。
- * 必要性：init 在 worker 创建失败时会销毁该 mutex 再返回失败，
- * 而 main.c 的清理仍会无条件调用 cell_config_destroy() → 二次 destroy（UB）。 */
-static bool g_cell_mgr_mutex_ready = false;
-
-static cell_cfg_job_t  *g_job_queue[CELL_CFG_JOB_QUEUE_LEN];
-static int              g_job_head = 0;
-static int              g_job_tail = 0;
-static int              g_job_count = 0;
-static pthread_mutex_t  g_job_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t   g_job_cond  = PTHREAD_COND_INITIALIZER;
-static pthread_t        g_job_thread;
-static bool             g_job_thread_valid = false;
-static bool             g_job_thread_stop  = false;
-
-static void cell_cfg_job_free(cell_cfg_job_t *job)
-{
-    if (job) {
-        free(job->payload);
-        free(job);
-    }
-}
-
-/* worker 线程：取作业 → 执行会阻塞的处理 → 发出响应 */
-static void *cell_cfg_worker(void *arg)
-{
-    (void)arg;
-
-    for (;;) {
-        pthread_mutex_lock(&g_job_mutex);
-        while (g_job_count == 0 && !g_job_thread_stop) {
-            pthread_cond_wait(&g_job_cond, &g_job_mutex);
-        }
-        if (g_job_count == 0 && g_job_thread_stop) {
-            pthread_mutex_unlock(&g_job_mutex);
-            break;
-        }
-
-        cell_cfg_job_t *job = g_job_queue[g_job_head];
-        g_job_queue[g_job_head] = NULL;
-        g_job_head = (g_job_head + 1) % CELL_CFG_JOB_QUEUE_LEN;
-        g_job_count--;
-        pthread_mutex_unlock(&g_job_mutex);
-
-        /* 用深拷贝的数据重建只读请求视图，复用原有的响应构造逻辑 */
-        cpri_message_t request;
-        memset(&request, 0, sizeof(request));
-        request.header.msg_id     = MSG_NR_CELL_CONFIG;
-        request.header.paau_id    = job->paau_id;
-        request.header.bbu_id     = job->bbu_id;
-        request.header.port_num   = job->port_num;
-        request.header.serial_num = job->serial_num;
-        request.payload           = job->payload;
-        request.payload_len       = job->payload_len;
-
-        cpri_message_t response;
-        if (cell_config_create_response(&response, &request) == SUCCESS) {
-            uint8_t buffer[CELL_CFG_RESP_BUF_SIZE];
-            int len = cpri_encode_message(&response, buffer, sizeof(buffer));
-            if (len > 0) {
-                tcp_client_send(&g_tcp_client, buffer, len);
-                LOG_INFO("Sent cell config response (serial_num=%u)", response.header.serial_num);
-            } else {
-                LOG_ERROR("Failed to encode cell config response (serial=%u)", job->serial_num);
-            }
-            cpri_free_message(&response);
-        } else {
-            LOG_ERROR("Failed to create cell config response (serial=%u)", job->serial_num);
-        }
-
-        cell_cfg_job_free(job);
-    }
-
-    LOG_INFO("Cell config worker thread exited");
-    return NULL;
-}
-
-/* 接收线程调用：深拷贝请求并入队，立即返回（不阻塞） */
-int cell_config_submit_request(const cpri_message_t *msg)
-{
-    if (!msg) {
-        return ERROR_INVALID_PARAM;
-    }
-
-    cell_cfg_job_t *job = (cell_cfg_job_t *)calloc(1, sizeof(cell_cfg_job_t));
-    if (!job) {
-        LOG_ERROR("Failed to alloc cell cfg job");
-        return ERROR_GENERAL;
-    }
-
-    job->paau_id     = msg->header.paau_id;
-    job->bbu_id      = msg->header.bbu_id;
-    job->port_num    = msg->header.port_num;
-    job->serial_num  = msg->header.serial_num;
-    job->payload_len = msg->payload_len;
-
-    if (msg->payload_len > 0 && msg->payload) {
-        job->payload = (uint8_t *)malloc(msg->payload_len);
-        if (!job->payload) {
-            LOG_ERROR("Failed to alloc job payload (%u bytes)", msg->payload_len);
-            free(job);
-            return ERROR_GENERAL;
-        }
-        memcpy(job->payload, msg->payload, msg->payload_len);
-    }
-
-    pthread_mutex_lock(&g_job_mutex);
-    if (g_job_count >= CELL_CFG_JOB_QUEUE_LEN) {
-        pthread_mutex_unlock(&g_job_mutex);
-        LOG_ERROR("Cell cfg job queue full, request dropped (serial=%u)", job->serial_num);
-        cell_cfg_job_free(job);
-        return ERROR_GENERAL;
-    }
-    g_job_queue[g_job_tail] = job;
-    g_job_tail = (g_job_tail + 1) % CELL_CFG_JOB_QUEUE_LEN;
-    g_job_count++;
-    pthread_cond_signal(&g_job_cond);
-    pthread_mutex_unlock(&g_job_mutex);
-
-    LOG_INFO("Cell config request queued (serial=%u, payload_len=%u)",
-             job->serial_num, job->payload_len);
-    return SUCCESS;
-}
 
 /**
  * 检查是否有任何已下发到天线并生效的频点
@@ -217,20 +65,6 @@ int cell_config_init(void)
         LOG_ERROR("Failed to init cell config mutex");
         return ERROR_GENERAL;
     }
-    g_cell_mgr_mutex_ready = true;
-
-    /* 启动异步 worker：把 5 秒模式校验移出 TCP 接收线程 */
-    g_job_head = 0;
-    g_job_tail = 0;
-    g_job_count = 0;
-    g_job_thread_stop = false;
-    if (pthread_create(&g_job_thread, NULL, cell_cfg_worker, NULL) != 0) {
-        LOG_ERROR("Failed to create cell config worker thread");
-        pthread_mutex_destroy(&g_cell_mgr.mutex);
-        g_cell_mgr_mutex_ready = false;   /* 已销毁，cleanup 不得再销毁一次 */
-        return ERROR_GENERAL;
-    }
-    g_job_thread_valid = true;
 
     LOG_INFO("Cell config manager initialized");
     return SUCCESS;
@@ -863,8 +697,7 @@ int cell_config_create_response(cpri_message_t *response, const cpri_message_t *
         memcpy(&ie_type, request->payload + req_offset, 2);
         memcpy(&ie_len, request->payload + req_offset + 2, 2);
 
-        /* IE长度包含IE头本身，不能小于IE头长度(4字节)；否则 offset 不推进将导致死循环 */
-        if (ie_len < 4 || req_offset + ie_len > request->payload_len) {
+        if (req_offset + ie_len > request->payload_len) {
             break;
         }
 
@@ -928,29 +761,6 @@ int cell_config_handle_request(const cpri_message_t *msg)
 /* 销毁小区配置管理器 */
 void cell_config_destroy(void)
 {
-    /* 必须先停 worker 并 join，否则它可能在 mutex 销毁后仍访问全局状态与 g_tcp_client。
-     * join 最长等待一次模式校验（5 秒），有界。 */
-    if (g_job_thread_valid) {
-        pthread_mutex_lock(&g_job_mutex);
-        g_job_thread_stop = true;
-        pthread_cond_signal(&g_job_cond);
-        pthread_mutex_unlock(&g_job_mutex);
-
-        pthread_join(g_job_thread, NULL);
-        g_job_thread = 0;
-        g_job_thread_valid = false;
-
-        /* 释放队列中尚未处理的作业 */
-        for (int i = 0; i < CELL_CFG_JOB_QUEUE_LEN; i++) {
-            cell_cfg_job_free(g_job_queue[i]);
-            g_job_queue[i] = NULL;
-        }
-        g_job_count = 0;
-    }
-
-    if (g_cell_mgr_mutex_ready) {
-        pthread_mutex_destroy(&g_cell_mgr.mutex);
-        g_cell_mgr_mutex_ready = false;
-    }
+    pthread_mutex_destroy(&g_cell_mgr.mutex);
     LOG_INFO("Cell config manager destroyed");
 }

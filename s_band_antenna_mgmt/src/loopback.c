@@ -311,9 +311,8 @@ int handle_loopback_request(const cpri_msg_header_t *req_header,
         return ret;
     }
 
-    /* 现阶段仅记录日志，不执行实际业务 */
     LOG_INFO("========================================");
-    LOG_INFO("LOOPBACK RECEIVED - Echo Mode");
+    LOG_INFO("LOOPBACK RECEIVED");
     LOG_INFO("========================================");
     LOG_INFO("Type:        %s", get_loopback_type_str(req_ie->loopback_type));
     LOG_INFO("Test Period: %u ms", le16toh(req_ie->test_period));
@@ -328,17 +327,31 @@ int handle_loopback_request(const cpri_msg_header_t *req_header,
     LOG_INFO("  beam_number   = 0x%02X", req_ie->beam_number);
     LOG_INFO("========================================");
 
+    /* 语义说明（重要）：
+     * FPGA 命令 FPGA_MSG_LOOPBACK(0x07) 的 payload 目前**只有 1 字节**（环回类型），
+     * 请求 IE 里的 test_period / port_number / beam_number 不会被下发——也就是说
+     * 做的是"类型级"环回，不是"端口级/波束级"环回。
+     * 要让 FPGA 按端口/波束做环回，需要先与 FPGA 方约定扩展 payload 的字段布局；
+     * 在那之前这里不能自行拼一个格式发出去。
+     * 同理，遥测里的 loopback_result 是"低4位有效"的位图，其位含义也需要 ICD 才能解释，
+     * 因此本函数不伪造它的语义。 */
+    if (req_ie->port_number != 0 || req_ie->beam_number != 0 ||
+        le16toh(req_ie->test_period) != 0) {
+        LOG_WARN("Loopback request specifies port=%u, beam=%u, period=%u ms, but the current "
+                 "FPGA loopback command carries ONLY the type — these parameters are NOT forwarded",
+                 req_ie->port_number, req_ie->beam_number, le16toh(req_ie->test_period));
+    }
+
     uint8_t loopback_result = LOOPBACK_RESULT_SUCCESS;
 
     int fpga_ret = fpga_send_loopback(req_ie->loopback_type);
 
-    LOG_INFO("Forwarding loopback command to FPGA: type=%u", req_ie->loopback_type);
-
     if (fpga_ret != SUCCESS) {
-        LOG_ERROR("Failed to send loopback command to FPGA");
+        LOG_ERROR("Failed to dispatch loopback command to FPGA");
         loopback_result = LOOPBACK_RESULT_NOT_SUPPORT;
     } else {
-        LOG_INFO("Loopback command sent to FPGA successfully");
+        LOG_INFO("Loopback command dispatched to FPGA: type=%u "
+                 "(应答反映的是命令下发结果，不是环回测试的实测结果)", req_ie->loopback_type);
         loopback_result = LOOPBACK_RESULT_SUCCESS;
     }
 
