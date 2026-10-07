@@ -17,6 +17,13 @@ static alarm_config_t g_alarm_config;
 /* g_alarm_mgr.mutex 是否处于"已初始化且未销毁"状态，使 destroy 在 init 失败时也安全 */
 static bool g_alarm_mutex_ready = false;
 
+/* 光链路告警启动宽限期的状态(判定逻辑见文件末尾 alarm_optical_in_grace)。
+ * 只由 alarm_periodic_check() 访问，而它只有 UART 接收线程一个调用者
+ * (uart_recv_thread -> on_fpga_status_received -> fpga_handler_on_status_update)，
+ * 故无需加锁；g_alarm_config 在 init 里写一次后线程才启动，同样只读。 */
+static bool     g_optical_grace_armed = false;  /* 首帧遥测是否已到、宽限是否已起算 */
+static uint64_t g_optical_grace_end   = 0;      /* 宽限期截止(单调时钟秒) */
+
 /* 外部TCP客户端引用 */
 extern tcp_client_t g_tcp_client;
 extern uint32_t g_serial_num;
@@ -85,6 +92,7 @@ int alarm_manager_init(const alarm_config_t *config)
         g_alarm_config.channel_fault_threshold = 10;
         g_alarm_config.over_temp_threshold_high = 85;
         g_alarm_config.over_temp_threshold_low = -40;
+        g_alarm_config.link_grace_sec = 10;
     }
 
     if (pthread_mutex_init(&g_alarm_mgr.mutex, NULL) != 0) {
@@ -96,10 +104,15 @@ int alarm_manager_init(const alarm_config_t *config)
     g_alarm_mgr.tcp_connected = false;
     g_alarm_mgr.pending_tcp_alarm = false;
 
-    LOG_INFO("Alarm manager initialized (fault_threshold=%u, temp_high=%d, temp_low=%d)",
+    /* 宽限期以"本次运行收到的第一帧遥测"为起点，重复 init 时需重新起算 */
+    g_optical_grace_armed = false;
+    g_optical_grace_end = 0;
+
+    LOG_INFO("Alarm manager initialized (fault_threshold=%u, temp_high=%d, temp_low=%d, link_grace=%us)",
              g_alarm_config.channel_fault_threshold,
              g_alarm_config.over_temp_threshold_high,
-             g_alarm_config.over_temp_threshold_low);
+             g_alarm_config.over_temp_threshold_low,
+             g_alarm_config.link_grace_sec);
     return SUCCESS;
 }
 
@@ -530,6 +543,56 @@ void alarm_clear_tcp_disconnect(void)
     }
 }
 
+/* ========== 光链路告警的启动宽限期 ========== */
+
+/* 取单调时钟秒数。宽限窗口不能用 time(NULL)：系统时钟被 NTP 校正、或
+ * RTC 未设置导致上电后大幅跳变时，墙钟会让宽限期意外提前结束、甚至
+ * 在已经过期后重新落回窗口内，把真实的光链路故障压住。 */
+static bool alarm_monotonic_sec(uint64_t *out)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return false;
+    }
+    *out = (uint64_t)ts.tv_sec;
+    return true;
+}
+
+/**
+ * @brief 光链路告警是否仍在启动宽限期内
+ *
+ * 首次调用(即收到第一帧 FPGA 遥测)时开始计时，此后 link_grace_sec 秒内返回 true。
+ * 宽限期内调用方【不更新状态跟踪器】，因此若到期时链路仍未建立，会在到期后的
+ * 第一帧按正常的 false->true 边沿报出 1097 —— 只是延迟，不会把真故障吞掉。
+ *
+ * @return true 处于宽限期内(应跳过光链路监测), false 正常监测
+ */
+static bool alarm_optical_in_grace(void)
+{
+    uint64_t now;
+
+    /* link_grace_sec=0 表示关闭宽限，回到改造前行为 */
+    if (g_alarm_config.link_grace_sec == 0) {
+        return false;
+    }
+
+    /* 取不到单调时钟就不做宽限：宁可早报，也不漏报 */
+    if (!alarm_monotonic_sec(&now)) {
+        return false;
+    }
+
+    if (!g_optical_grace_armed) {
+        g_optical_grace_armed = true;
+        g_optical_grace_end = now + g_alarm_config.link_grace_sec;
+        LOG_INFO("Optical link alarm grace period started: %u s",
+                 g_alarm_config.link_grace_sec);
+        return true;
+    }
+
+    return now < g_optical_grace_end;
+}
+
 /* 周期性告警检测任务(从FPGA遥测数据检测) */
 void alarm_periodic_check(const fpga_status_frame_t *fpga_status)
 {
@@ -548,13 +611,21 @@ void alarm_periodic_check(const fpga_status_frame_t *fpga_status)
     /* 3. 检查通道故障过多告警 (告警码: 1159) */
     alarm_check_channel_fault_exceed(fpga_status->data.channel_fault_count);
 
-    /* 4. 检查光链路同步码流丢失 (告警码: 1097, 子码: 光口号0-7) */
-    for (int i = 0; i < 4; i++) {
-        bool main_sync = (fpga_status->data.link_success_flag & (1 << i)) != 0;
-        alarm_check_optical_sync_loss(i, main_sync);
+    /* 4. 检查光链路同步码流丢失 (告警码: 1097, 子码: 光口号0-7)
+     *
+     * 启动宽限期内整段跳过：上电后 CPRI 光链路还在协商，link_success_flag
+     * 本来就读 0，而状态跟踪器在 alarm_manager_init 里被清零(等于"初始视为
+     * 链路正常")，于是第一帧遥测就会把这段正常建链过程报成 4 条 1097。
+     * 宽限期内不调用 alarm_check_optical_sync_loss，也就不会更新状态跟踪器，
+     * 所以到期仍未建链时会在到期后第一帧正常报出(只延迟，不吞掉)。 */
+    if (!alarm_optical_in_grace()) {
+        for (int i = 0; i < 4; i++) {
+            bool main_sync = (fpga_status->data.link_success_flag & (1 << i)) != 0;
+            alarm_check_optical_sync_loss(i, main_sync);
 
-        // bool backup_sync = (fpga_status->data.link_success_flag & (1 << (i + 4))) != 0;
-        // alarm_check_optical_sync_loss(i + 4, backup_sync);
+            // bool backup_sync = (fpga_status->data.link_success_flag & (1 << (i + 4))) != 0;
+            // alarm_check_optical_sync_loss(i + 4, backup_sync);
+        }
     }
 }
 

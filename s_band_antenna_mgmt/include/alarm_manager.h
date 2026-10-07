@@ -86,6 +86,7 @@ typedef struct {
     uint8_t channel_fault_threshold;    /* 通道故障门限 */
     int8_t over_temp_threshold_high;    /* 过温门限(°C) */
     int8_t over_temp_threshold_low;     /* 低温门限(°C) */
+    uint32_t link_grace_sec;            /* 光链路告警启动宽限期(秒), 0=关闭 */
 } alarm_config_t;
 
 /**

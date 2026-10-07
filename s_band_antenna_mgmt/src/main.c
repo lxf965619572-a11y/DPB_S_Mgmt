@@ -252,7 +252,11 @@ int main(int argc, char *argv[])
     alarm_config_t alarm_config = {
         .channel_fault_threshold = 10,
         .over_temp_threshold_high = 85,
-        .over_temp_threshold_low = -40
+        .over_temp_threshold_low = -40,
+        /* 光链路告警启动宽限期：上电后 CPRI 光链路还在协商，这段时间
+         * link_success_flag 本来就读 0，不设宽限会把正常建链过程报成
+         * 4 条 1097 告警。从第一帧 FPGA 遥测起算，0=关闭。 */
+        .link_grace_sec = config_get_uint32("ALARM_LINK_GRACE_SEC", 10)
     };
     ret = alarm_manager_init(&alarm_config);
     if (ret != SUCCESS) {
