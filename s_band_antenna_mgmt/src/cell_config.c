@@ -182,29 +182,124 @@ static bool has_any_freq(void)
     return false;
 }
 
+/* ==================== 发射控制 ====================
+ * 是否开发射由两个条件共同决定：
+ *   1) 天线侧存在已下发并生效的频点 (has_any_freq)；
+ *   2) 与基带(BBU)处于可通信状态 (g_bbu_link_ok)。
+ * 与基带无法通信时禁止开发射，并在判定失联的瞬间下发一次关闭发射。
+ * ================================================= */
+
+/* 与基带是否处于可通信状态。false = 已判定"与基带无法通信"，此期间禁止开发射。
+ * 由 cell_config_notify_bbu_link() 在链路事件处更新（TCP 接收线程 / 主线程），
+ * 由 worker 线程在 update_tx_control() 里读取，故用独立互斥锁保护。
+ * 锁序固定为 g_cell_mgr.mutex → g_tx_guard_mutex：update_tx_control() 是在持有
+ * g_cell_mgr.mutex 的情况下取本锁的，而反向取锁的路径不存在，不会死锁。
+ * 初值 false：上电后尚未与基带建立通道，不认为可通信。
+ * 本锁在其生命周期内不销毁：cell_config_destroy() 之后 TCP 接收线程仍可能
+ * 回调 cell_config_notify_bbu_link()（main.c 先销毁 cell_config 再停 TCP），
+ * 销毁本锁会让那条路径锁到已销毁的互斥量。 */
+static pthread_mutex_t g_tx_guard_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool            g_bbu_link_ok = false;
+
+/* 本地记录的发射开关状态。FPGA 的 0x0B(发射控制) 无应答，"当前是否在发射"
+ * 只能以本地下发成功为准；用于把"基带失联 → 关发射"做成 发→关 跳变去重，
+ * 避免链路抖动时反复下发同一条指令。上电按 FPGA 默认关发射处理。 */
+static bool            g_tx_on = false;
+
+/* 下发发射控制并记录状态。仅在下发成功时更新记录：
+ * 若本次下发失败，记录仍停留在"发射中"，于是后续任何一次链路事件都会再次
+ * 尝试补发关闭指令。注意这【不是】本次失联期间的周期重发（按策略只在
+ * 发→关跳变时发一次），UART 写失败会打 ERROR 供现场定位。 */
+static void apply_tx_control(bool on, const char *reason)
+{
+    int ret = fpga_send_tx_control(on ? 1 : 0);
+    if (ret != SUCCESS) {
+        LOG_ERROR("Failed to %s TX (%s)", on ? "enable" : "disable",
+                  reason ? reason : "unknown");
+        return;
+    }
+
+    pthread_mutex_lock(&g_tx_guard_mutex);
+    g_tx_on = on;
+    pthread_mutex_unlock(&g_tx_guard_mutex);
+
+    LOG_INFO("TX %s (%s)", on ? "enabled" : "disabled",
+             reason ? reason : "unknown");
+}
+
 /**
- * 根据全局频点状态控制发射
+ * 根据全局频点状态与基带链路状态控制发射
  */
 static void update_tx_control(void)
 {
-    bool has_freq = has_any_freq();
+    bool link_ok;
 
-    if (has_freq) {
+    pthread_mutex_lock(&g_tx_guard_mutex);
+    link_ok = g_bbu_link_ok;
+    pthread_mutex_unlock(&g_tx_guard_mutex);
+
+    /* 与基带无法通信：合上"开射"闸门。关闭指令已由 cell_config_notify_bbu_link()
+     * 在判定失联时下发，这里直接返回；等基带重新建立通道并重新下发频点配置后，
+     * 本函数才会再次放开。这一道闸门也挡掉了链路中断前入队、中断后才跑完的
+     * 频点配置作业（worker 里最长会等 5 秒天线模式校验），否则它会把发射又打开。 */
+    if (!link_ok) {
+        LOG_WARN("BBU link down, TX enable suppressed (has_freq=%d)", has_any_freq());
+        return;
+    }
+
+    if (has_any_freq()) {
         /* 有频点，开启发射 */
-        int tx_ret = fpga_send_tx_control(1);
-        if (tx_ret != SUCCESS) {
-            LOG_ERROR("Failed to enable TX");
-        } else {
-            LOG_INFO("TX enabled: at least one cell has freqs");
-        }
+        apply_tx_control(true, "at least one cell has freqs");
     } else {
         /* 没有频点，关闭发射 */
-        int tx_ret = fpga_send_tx_control(0);
-        if (tx_ret != SUCCESS) {
-            LOG_ERROR("Failed to disable TX");
-        } else {
-            LOG_INFO("TX disabled: no freqs in any cell");
+        apply_tx_control(false, "no freqs in any cell");
+    }
+}
+
+/**
+ * 通知基带(BBU)链路状态 —— "与基带无法通信时关闭发射"的落点
+ *
+ * up=false：判定与基带无法通信。若本地记录发射为开启，向天线下发一次关闭发射，
+ *           并禁止后续开发射，直到基带重新建立通道。
+ * up=true ：基带通道已重新建立，放开"允许开发射"的闸门。此处【不】直接开射，
+ *           实际开射仍由基带随后的频点配置经 update_tx_control() 触发。
+ *
+ * 可重复调用：只在状态跳变时产生动作与日志，不会因为每秒轮询而重复下发。
+ */
+void cell_config_notify_bbu_link(bool up, const char *reason)
+{
+    const char *why = reason ? reason : "unknown";
+    bool was_ok;
+    bool need_off = false;
+
+    pthread_mutex_lock(&g_tx_guard_mutex);
+    was_ok = g_bbu_link_ok;
+
+    if (up) {
+        g_bbu_link_ok = true;
+    } else {
+        g_bbu_link_ok = false;
+        /* 只在本地认为"正在发射"时才下发关闭，避免链路抖动时反复发同一条指令 */
+        need_off = g_tx_on;
+    }
+    pthread_mutex_unlock(&g_tx_guard_mutex);
+
+    if (up) {
+        if (!was_ok) {
+            LOG_INFO("BBU link available again (%s), TX enable re-armed", why);
         }
+        return;
+    }
+
+    if (!was_ok && !need_off) {
+        /* 链路本就不通、发射本就没开：无动作，也不重复打日志 */
+        return;
+    }
+
+    LOG_WARN("BBU link lost (%s)", why);
+
+    if (need_off) {
+        apply_tx_control(false, "BBU link lost");
     }
 }
 

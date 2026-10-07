@@ -118,6 +118,18 @@ int cell_config_submit_request(const cpri_message_t *msg);
 /* 生成NR小区配置响应 (MsgID 196) */
 int cell_config_create_response(cpri_message_t *response, const cpri_message_t *request);
 
+/**
+ * 通知基带(BBU)链路状态 —— "与基带无法通信时关闭发射"的落点
+ *
+ * up=false：判定与基带无法通信（TCP 断开 / 基带心跳超时）。若本地记录发射为
+ *           开启，立即向天线下发一次关闭发射 (FPGA 0x0B=0)，并禁止后续开发射。
+ * up=true ：基带通道已重新建立，放开"允许开发射"的闸门；实际开射仍等基带
+ *           重新下发频点配置。
+ *
+ * 可重复调用，只在状态跳变时产生动作与日志。
+ */
+void cell_config_notify_bbu_link(bool up, const char *reason);
+
 /* 销毁小区配置管理器 */
 void cell_config_destroy(void);
 

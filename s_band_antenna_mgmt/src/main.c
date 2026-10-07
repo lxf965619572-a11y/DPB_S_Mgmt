@@ -98,6 +98,8 @@ static void on_tcp_disconnected(void)
     g_channel_established = false;
     /* 停止心跳 */
     heartbeat_stop();
+    /* 与基带无法通信：给天线发关闭发射指令 */
+    cell_config_notify_bbu_link(false, "TCP disconnected from BBU");
 }
 
 /* TCP数据接收回调 */
@@ -148,6 +150,9 @@ static void on_tcp_data_received(const uint8_t *data, uint32_t len)
             if (msg.header.msg_id == MSG_CHANNEL_SETUP_CFG) {
                 LOG_INFO("Received channel setup config, stopping periodic requests");
                 g_channel_established = true;
+                /* 基带通道重新建立，放开"允许开发射"的闸门。
+                 * 此处不直接开射：实际开射仍等基带重新下发频点配置。 */
+                cell_config_notify_bbu_link(true, "channel established with BBU");
             }
 
             /* 分发消息处理 */
@@ -482,6 +487,9 @@ int main(int argc, char *argv[])
                 /* 生成告警并重连 */
                 g_channel_established = false;
                 heartbeat_stop();
+                /* TCP还连着但基带不再应答，同样属于"与基带无法通信"：
+                 * 给天线发关闭发射指令。恢复要等基带重新完成通道建立。 */
+                cell_config_notify_bbu_link(false, "BBU heartbeat timeout");
                 /* TCP会自动重连，重新进入通道建立流程 */
             }
         } else {
