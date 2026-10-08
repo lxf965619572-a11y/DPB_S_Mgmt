@@ -8,6 +8,19 @@
 static void* uart_recv_thread(void *arg);
 static void* uart_poll_thread(void *arg);
 
+/* 遥测日志帧(0xEB93)被拒时的日志限频。
+ * 乱码持续涌进来时，每个"看起来像帧头"的候选都打一条 WARN，会把只有 10MB 就轮转的
+ * 文本日志刷满、把真正的故障记录挤出去，而且每条 WARN 都要抢 g_log_mutex、拖慢接收线程。
+ * 策略：前 10 条全报（便于定位首次异常），之后每 100 条报 1 条。
+ * 只由 UART 接收线程访问，故不需要加锁。 */
+static uint32_t g_tel_reject_count = 0;
+
+static bool telemetry_reject_should_log(void)
+{
+    g_tel_reject_count++;
+    return (g_tel_reject_count <= 10) || (g_tel_reject_count % 100 == 0);
+}
+
 int uart_client_init(uart_client_t *client, const char *device)
 {
     if (!client || !device) {
@@ -162,22 +175,40 @@ static void* uart_recv_thread(void *arg)
                 uint8_t *buf_start = frame_buffer + processed_bytes;
                 uint32_t remaining = frame_offset - processed_bytes;
 
-                /* 搜索帧头 */
+                /* 搜索帧头。本 UART 上有两种帧混流且分帧规则不同：
+                 *   0xEB90 状态帧    = 帧头(2) + 长度(2,大端) + 数据(127) + 帧尾(2)
+                 *   0xEB93 遥测日志帧 = 帧头(2) + 来源(1) + 长度(1) + 数据(N) + 帧尾(2)
+                 * 所以先扫出命中哪一种，再走各自的长度的解析。
+                 *
+                 * 扫描上界用 header_pos + 1 < remaining（等价于"还够读 2 字节"）：
+                 * 原写法 header_pos < remaining - 1 在 remaining == 1 时循环体一次都不
+                 * 执行，末尾那 1 个字节会被下面判为"找不到帧头"而整块丢弃 —— 若它恰好是
+                 * 被 read() 切断的半个帧头(0xEB)，该帧就必丢。混流两种帧头后重新同步更
+                 * 频繁，这个缺陷会被放大，故一并修正。 */
                 uint32_t header_pos = 0;
+                uint16_t frame_hdr = 0;
                 bool found_header = false;
-                for (header_pos = 0; header_pos < remaining - 1; header_pos++) {
-                    uint16_t header;
-                    memcpy(&header, buf_start + header_pos, 2);
-                    header = NTOHS(header);
-                    if (header == FPGA_FRAME_HEADER) {
+                for (header_pos = 0; header_pos + 1 < remaining; header_pos++) {
+                    memcpy(&frame_hdr, buf_start + header_pos, 2);
+                    frame_hdr = NTOHS(frame_hdr);
+                    if (frame_hdr == FPGA_FRAME_HEADER ||
+                        frame_hdr == FPGA_TELEMETRY_LOG_HEADER) {
                         found_header = true;
                         break;
                     }
                 }
 
                 if (!found_header) {
-                    /* 没有找到帧头，丢弃所有数据 */
-                    processed_bytes = frame_offset;
+                    /* 没有找到帧头。通常整块丢弃；唯一例外是末尾那个字节等于帧头首字节
+                     * (0xEB90/0xEB93 的首字节同为 0xEB)，它可能是被 read() 切断的半个
+                     * 帧头，保留它等下一批数据拼回来。只保留这一种字节，是为了避免在长串
+                     * 垃圾数据里每轮都留下 1 字节、把同一条 WARN 反复打出来。 */
+                    if (remaining >= 1 &&
+                        buf_start[remaining - 1] == (uint8_t)(FPGA_FRAME_HEADER >> 8)) {
+                        processed_bytes += remaining - 1;
+                    } else {
+                        processed_bytes = frame_offset;
+                    }
                     break;
                 }
 
@@ -189,22 +220,49 @@ static void* uart_recv_thread(void *arg)
                 buf_start += header_pos;
                 remaining -= header_pos;
 
-                /* 检查是否有足够数据读取长度字段 */
+                /* 两种帧都要够读偏移 2、3 两字节才能定位长度 */
                 if (remaining < 4) {
                     break;  /* 等待更多数据 */
                 }
 
-                /* 读取长度字段（2字节，大端序） */
-                uint16_t length_field;
-                memcpy(&length_field, buf_start + 2, 2);
-                length_field = NTOHS(length_field);
+                uint32_t expected_frame_len;
+                uint16_t length_field = 0;   /* 仅 0xEB90 状态帧有效，分发时要用 */
 
-                /* 计算完整帧长度 */
-                uint32_t expected_frame_len = 2 + 2 + length_field + 2;
+                if (frame_hdr == FPGA_TELEMETRY_LOG_HEADER) {
+                    /* 遥测日志帧：偏移2 = 来源，偏移3 = "有效数据长度"，总长 = 6 + N。
+                     * 这里同时做来源白名单与长度交叉校验，理由见
+                     * fpga_telemetry_payload_len() 的注释：帧头+帧尾两项校验太弱，
+                     * 满速乱码下平均每分钟就能凑出一个假帧。
+                     * 校验不过按非法帧处理，只丢 1 字节重新同步。 */
+                    uint8_t  src      = buf_start[2];
+                    uint8_t  data_len = buf_start[3];
+                    uint32_t expect_len = fpga_telemetry_payload_len(src);
 
-                /* 验证帧长度的合理性 */
-                if (expected_frame_len < 6 || expected_frame_len > sizeof(frame_buffer)) {
-                    LOG_ERROR("Invalid frame length: %u, discarding 1 byte", expected_frame_len);
+                    if (expect_len == 0 || data_len != expect_len) {
+                        if (telemetry_reject_should_log()) {
+                            /* 必须带上来源与实际长度：FPGA 若改了载荷长度，现场只表现为
+                             * "遥测日志突然空了一半"，有这两个值才能一眼看出原因 */
+                            LOG_WARN("Telemetry frame rejected: src=0x%02X len=%u "
+                                     "(protocol len=%u), drop 1 byte",
+                                     src, data_len, expect_len);
+                        }
+                        processed_bytes += 1;
+                        continue;
+                    }
+                    expected_frame_len = 6 + data_len;
+                } else {
+                    /* 状态帧：偏移 2 起 2 字节大端长度（FPGA 实际发的是 0x00 0x7F） */
+                    memcpy(&length_field, buf_start + 2, 2);
+                    length_field = NTOHS(length_field);
+                    expected_frame_len = 2 + 2 + length_field + 2;
+                }
+
+                /* 帧长度的通用合理性检查。
+                 * 遥测分支上面已把长度钉在协议值上，这里实际只对状态帧生效。 */
+                if (expected_frame_len < FPGA_MIN_FRAME_SIZE ||
+                    expected_frame_len > sizeof(frame_buffer)) {
+                    LOG_ERROR("Invalid frame length: %u (header=0x%04X), discarding 1 byte",
+                              expected_frame_len, frame_hdr);
                     processed_bytes += 1;
                     continue;
                 }
@@ -225,8 +283,18 @@ static void* uart_recv_thread(void *arg)
                     continue;
                 }
 
-                /* 处理完整帧 */
-                if (expected_frame_len == 133 && length_field == 127) {
+                /* 处理完整帧。按帧头分流：遥测日志帧原样交给上层落盘；0xEB90 帧沿用
+                 * 原有判定（133/127 → 状态帧，其余走 on_data_received）。
+                 * 刻意不把 0xEB93 塞进下面的 else：那会把遥测帧交给 on_data_received，
+                 * 而 main.c 的实现是空壳会直接把数据丢掉。 */
+                if (frame_hdr == FPGA_TELEMETRY_LOG_HEADER) {
+                    /* buf_start 指向本线程的 static frame_buffer，循环末尾的 memmove
+                     * 会立刻覆盖它 —— 回调实现必须在返回前把整帧拷走，不能只存指针。
+                     * （与 on_status_received 传 &static_status 是同一类约定。） */
+                    if (client->on_telemetry_log_frame) {
+                        client->on_telemetry_log_frame(buf_start, expected_frame_len);
+                    }
+                } else if (expected_frame_len == 133 && length_field == 127) {
                     /* 状态响应帧 */
                     if (expected_frame_len == sizeof(fpga_status_frame_t)) {
                         /* 使用静态缓冲区，避免栈溢出 */

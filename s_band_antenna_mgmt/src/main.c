@@ -26,6 +26,7 @@
 #include "uart_rs422_client.h"
 #include "fpga_firmware_injector.h"
 #include "fpga_watchdog.h"
+#include "telemetry_log.h"
 #include <signal.h>
 
 tcp_client_t g_tcp_client;  /* 全局TCP客户端，供msg_handler使用 */
@@ -379,12 +380,26 @@ int main(int argc, char *argv[])
     /* 设置UART回调函数 */
     g_uart_client.on_data_received = on_uart_data_received;
     g_uart_client.on_status_received = on_fpga_status_received;
+    /* 必须在下方的 uart_client_open 之前装配好：接收线程一旦起来，早到的
+     * 0xEB93 遥测日志帧就会因为回调为空而被丢弃 */
+    g_uart_client.on_telemetry_log_frame = telemetry_log_on_frame;
 
     /* 打开UART设备 */
     ret = uart_client_open(&g_uart_client);
     if (ret != SUCCESS) {
         LOG_WARN("Failed to open UART device (will continue without FPGA communication)");
         /* 不退出，继续运行TCP部分 */
+    }
+
+    /* 初始化遥测日志（每分钟轮询 V7A/V7B1/V7B2 并把回复的 0xEB93 帧落盘）。
+     * 放在 uart_client_open 之后：轮询线程要经 UART 下发命令。
+     * 放在 tcp_client_start 之前：基带随时可能下发日志上传请求，而上传打包时要读
+     * 遥测日志文件，先把依赖就绪。
+     * 失败不 goto cleanup：遥测日志是旁路功能，不该拖垮主服务（与上面 UART 打不开
+     * 的处理一致）。 */
+    ret = telemetry_log_init();
+    if (ret != SUCCESS) {
+        LOG_WARN("Failed to init telemetry log (will continue without telemetry logging)");
     }
 
     /* 初始化FPGA看门狗 */
@@ -518,6 +533,18 @@ cleanup:
      * 否则 worker 可能在 send_mutex 被销毁后仍去锁它。 */
     cell_config_destroy();
 
+    /* telemetry_log 的轮询线程会调 uart_client_send，所以必须在 uart_client_close
+     * 之前停掉并 join（否则 uart_client_destroy 销毁 send_mutex 后线程仍可能去锁它）。
+     * 放在这里而不是更早：与 cell_config 一样属于"有后台线程的模块"统一排在这一段的约定。
+     * 此后 UART 接收线程可能仍在跑并回调 telemetry_log_on_frame，回调内部会检查 stop
+     * 标志后静默返回，不会往已停用的队列里推数据。 */
+    telemetry_log_destroy();
+
+    /* log_upload 的上传线程会调 tcp_client_send，必须在 TCP 拆卸之前置停止位，
+     * 否则线程可能撞上已销毁的 send_mutex（见 log_upload_destroy 的说明）。
+     * 顺带放在 telemetry_log_destroy 之后：上传打包要读遥测日志文件。 */
+    log_upload_destroy();
+
     tcp_client_stop(&g_tcp_client);
     tcp_client_destroy(&g_tcp_client);
     uart_client_close(&g_uart_client);
@@ -525,7 +552,6 @@ cleanup:
     fpga_handler_destroy();
     heartbeat_destroy();
     alarm_manager_destroy();
-    log_upload_destroy();
     version_manager_destroy();
     alarm_query_cleanup();
     loopback_cleanup();

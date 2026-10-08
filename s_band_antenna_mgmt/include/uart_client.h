@@ -30,6 +30,9 @@ typedef struct {
     /* 回调函数 */
     void (*on_data_received)(const uint8_t *data, uint32_t len);
     void (*on_status_received)(const void *status);
+    /* 遥测日志帧（帧头 0xEB93）到达。frame 指向帧头、len 为含帧头帧尾的整帧长度，
+     * 内存由接收线程的静态缓冲区持有，【仅在回调期间有效】，实现方必须立即拷贝。 */
+    void (*on_telemetry_log_frame)(const uint8_t *frame, uint32_t len);
 } uart_client_t;
 
 /* 函数声明 */

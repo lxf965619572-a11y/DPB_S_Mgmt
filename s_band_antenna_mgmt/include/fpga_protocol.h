@@ -7,6 +7,19 @@
 /* FPGA帧格式定义 */
 #define FPGA_FRAME_HEADER       0xEB90  /* 帧头（大端） */
 #define FPGA_FRAME_TAIL         0x5555  /* 帧尾（大端） */
+
+/* 遥测日志帧的帧头。与 0xEB90 状态帧在同一根 UART 上混流，但【分帧规则不同】：
+ *   0xEB90: 帧头(2) + 长度(2,大端) + 数据(127) + 帧尾(2)      = 133
+ *   0xEB93: 帧头(2) + 来源(1) + 长度(1) + 数据(N) + 帧尾(2)    = 6 + N
+ * 0xEB90 之所以能被"偏移2起读2字节长度"解析，只是因为 FPGA 在那两位发的恰好是
+ * 0x00 0x7F(=127)；若按同一规则去读 0xEB93 帧，偏移2-3 是 来源+长度，会读出
+ * 0xA1xx 这种远超缓冲区上限的值而被整帧丢弃。所以接收侧必须按帧头分流。 */
+#define FPGA_TELEMETRY_LOG_HEADER   0xEB93
+
+/* 遥测日志帧"有效数据长度"字段的取值（V7A 暂定 127，V7B 暂定 146）。
+ * 仅用于校验与日志，不用于定长解析——长度以帧内字段为准。 */
+#define FPGA_TELEMETRY_LOG_LEN_V7A  127
+#define FPGA_TELEMETRY_LOG_LEN_V7B  146
 #define FPGA_HEADER_SIZE        2       /* 帧头2字节 */
 #define FPGA_MSG_ID_SIZE        1       /* 消息ID 1字节 */
 #define FPGA_LENGTH_SIZE        1       /* 长度字段1字节 */
@@ -29,6 +42,12 @@ typedef enum {
     FPGA_MSG_POWER_OFF_ACK = 0x0D,      /* 断电应答 */
     FPGA_MSG_LOG_QUERY = 0x11,          /* 日志查询 */
     FPGA_MSG_PASSTHROUGH = 0x12,        /* 透传数据 */
+
+    /* 遥测日志轮询：D2000 每分钟各发一次，对应板卡收到后回一轮 0xEB93 遥测日志帧 */
+    FPGA_MSG_TELEMETRY_POLL_V7A  = 0xA1,  /* 遥测轮询 V7A */
+    FPGA_MSG_TELEMETRY_POLL_V7B1 = 0xB1,  /* 遥测轮询 V7B1 */
+    FPGA_MSG_TELEMETRY_POLL_V7B2 = 0xB2,  /* 遥测轮询 V7B2 */
+
     FPGA_MSG_STATUS_QUERY = 0xFF,       /* 状态检询 */
 } fpga_msg_id_t;
 
@@ -162,6 +181,18 @@ uint32_t fpga_decode_frequency(uint32_t encoded_freq);
 
 /* FPGA消息编解码函数 */
 int fpga_encode_message(const fpga_message_t *msg, uint8_t *buffer, uint32_t buffer_size);
+
+/* 遥测日志帧(0xEB93)"来源 → 有效数据长度"映射。
+ * 返回 0 = 来源不认识。
+ *
+ * 接收侧用它做白名单 + 长度交叉校验：只靠"帧头 2 字节 + 帧尾 2 字节"太弱——
+ * 随机字节流里平均约 1.8e-7/字节位置就能凑出一个"合法帧"，921600 满速乱码下
+ * 约每分钟一个，会在遥测日志里混入假记录并吞掉其后约 150 字节（可能吃掉真帧的开头）。
+ * 叠加来源白名单(3/256)与长度校验(1/128)后概率才降到按天计。
+ *
+ * ⚠️ 代价：FPGA 侧若改了某种板的载荷长度，对应帧会被拒。所以调用方在拒绝时
+ * 必须把来源和实际长度打进日志，否则现场只表现为"遥测日志突然空了一半"而无从定位。 */
+uint32_t fpga_telemetry_payload_len(uint8_t src);
 int fpga_decode_message(const uint8_t *buffer, uint32_t buffer_len, fpga_message_t *msg);
 int fpga_decode_status_frame(const uint8_t *buffer, uint32_t buffer_len, fpga_status_frame_t *status);
 void fpga_free_message(fpga_message_t *msg);

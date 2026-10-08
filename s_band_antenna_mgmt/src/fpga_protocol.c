@@ -261,6 +261,19 @@ int fpga_decode_status_frame(const uint8_t *buffer, uint32_t buffer_len, fpga_st
     return SUCCESS;
 }
 
+/* 遥测日志帧(0xEB93)的"来源 → 有效数据长度"映射，供接收侧的白名单校验使用。
+ * 来源取值与上行轮询命令码相同（0xA1/0xB1/0xB2）——这是协议约定：FPGA 用
+ * "这条帧是回答哪条命令"作为来源标识，不是巧合，故直接复用同一组枚举。 */
+uint32_t fpga_telemetry_payload_len(uint8_t src)
+{
+    switch (src) {
+        case FPGA_MSG_TELEMETRY_POLL_V7A:  return FPGA_TELEMETRY_LOG_LEN_V7A;
+        case FPGA_MSG_TELEMETRY_POLL_V7B1: return FPGA_TELEMETRY_LOG_LEN_V7B;
+        case FPGA_MSG_TELEMETRY_POLL_V7B2: return FPGA_TELEMETRY_LOG_LEN_V7B;
+        default:                           return 0;
+    }
+}
+
 void fpga_free_message(fpga_message_t *msg)
 {
     if (msg && msg->payload) {
