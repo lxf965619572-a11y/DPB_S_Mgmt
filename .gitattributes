@@ -1,0 +1,11 @@
+# 本项目目标是 Linux 设备（D2000），但开发机是 Windows 且 git 配了 core.autocrlf=true。
+#
+# 默认行为会在检出时把 LF 转成 CRLF，对 shell 脚本是致命的：shebang 变成
+# "#!/bin/bash\r"，内核去找不存在的 /bin/bash\r，报
+#   ./deploy-autostart.sh: /bin/bash^M: bad interpreter: No such file or directory
+# 现场表现很容易被误读成"文件不存在"（sudo: unable to execute ./xxx.sh:
+# No such file or directory），而文件其实好好地在 ls 里。
+#
+# 这里统一按 LF 检出，使 core.autocrlf 设置失效。二进制文件（.docx 等）由
+# text=auto 自动识别，不受影响。
+* text=auto eol=lf
