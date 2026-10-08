@@ -527,8 +527,10 @@ static int send_transfer_abort(fpga_injection_task_t *task)
 }
 
 /* 发送A3P(FPGA)上注通报帧。
- * notify_code = RS422_UPLOAD_NOTIFY_PRE  上注前(帧尾校验 66)
- *             = RS422_UPLOAD_NOTIFY_POST 上注后(帧尾校验 67)
+ * notify_code = RS422_UPLOAD_NOTIFY_PRE  上注前
+ *             = RS422_UPLOAD_NOTIFY_POST 上注后
+ * （帧尾校验和随帧头的包序列计数变化，不是定值，故此处不写具体数值。
+ *   帧结构见 rs422_protocol.h 里 RS422_CMD_UPLOAD_NOTIFY 的注释。）
  * 属"告知"性质, 发送失败只记录日志, 不改变上注结果。 */
 static int send_upload_notify(fpga_injection_task_t *task, uint8_t notify_code, const char *when)
 {
