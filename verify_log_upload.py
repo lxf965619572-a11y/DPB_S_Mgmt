@@ -55,6 +55,11 @@ POLL_LEN = {0xA1: 127, 0xB1: 146, 0xB2: 146}
 BBU_PORT = 40001
 FTP_PORT = 2121
 
+# 刻意用与默认值不同的文件名：归档内的成员名应当跟随这两个配置项，
+# 而不是写死成 antenna_mgmt.log / telemetry.bin。若有人改回写死，下面的断言会失败。
+TEXT_BASENAME = "paau_text.log"
+TEL_BASENAME = "paau_tel.bin"
+
 FAILURES = []
 CHECKS = 0
 
@@ -210,8 +215,8 @@ def main():
             "TELEMETRY_LOG_MAX_BACKUPS=3\nTELEMETRY_LOG_POLL_SEC=1\n"
             "TELEMETRY_LOG_POLL_GAP_MS=20\nALARM_LINK_GRACE_SEC=10\n"
             "PAAU_ID_CHECK=0\nFTP_SERVER=127.0.0.1\nFTP_PORT=%d\n"
-            % (BBU_PORT, dev, os.path.join(logs, "text.log"),
-               os.path.join(logs, "telemetry.bin"), FTP_PORT))
+            % (BBU_PORT, dev, os.path.join(logs, TEXT_BASENAME),
+               os.path.join(logs, TEL_BASENAME), FTP_PORT))
 
     out_f = open(os.path.join(tmp, "stdout.log"), "wb")
     proc = subprocess.Popen([binary, cfg], cwd=tmp, stdout=out_f,
@@ -341,10 +346,11 @@ def main():
                 with tarfile.open(pkg, "r:gz") as tf:
                     names = sorted(tf.getnames())
                     print("  [info] 包内成员: %s" % names)
-                    check(names == ["antenna_mgmt.log", "telemetry.bin"],
-                          "包内含文本日志 + 遥测日志两个文件", str(names))
-                    tel = tf.extractfile("telemetry.bin").read()
-                    txt = tf.extractfile("antenna_mgmt.log").read()
+                    check(names == sorted([TEXT_BASENAME, TEL_BASENAME]),
+                          "包内成员名跟随 LOG_FILE / TELEMETRY_LOG_FILE 的 basename",
+                          "实际=%s, 期望=%s" % (names, sorted([TEXT_BASENAME, TEL_BASENAME])))
+                    tel = tf.extractfile(TEL_BASENAME).read()
+                    txt = tf.extractfile(TEXT_BASENAME).read()
                 check(len(txt) > 0, "包内文本日志非空", "%d 字节" % len(txt))
                 frames, err = parse_tel_stream(tel)
                 check(err is None and len(frames) >= 3,
@@ -361,7 +367,7 @@ def main():
         leftovers = os.listdir(tmpdir) if os.path.isdir(tmpdir) else []
         check(leftovers == [], "本地临时目录无残留", str(leftovers))
 
-        log = open(os.path.join(logs, "text.log"), "rb").read().decode("utf-8", "replace")
+        log = open(os.path.join(logs, TEXT_BASENAME), "rb").read().decode("utf-8", "replace")
         check("Uploading log package" in log, "日志里有打包上传记录")
         check("Telemetry log snapshot created" in log, "遥测日志快照已创建")
     finally:
@@ -388,7 +394,7 @@ def main():
         for f in FAILURES:
             print("  - %s" % f)
         print("\n--- 程序日志尾部 ---")
-        print(open(os.path.join(logs, "text.log"), "rb").read().decode("utf-8", "replace")[-3000:])
+        print(open(os.path.join(logs, TEXT_BASENAME), "rb").read().decode("utf-8", "replace")[-3000:])
         return 1
     print("结果: 全部通过（%d 项检查）" % CHECKS)
     return 0

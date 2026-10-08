@@ -221,6 +221,37 @@ static int ftp_upload_file_with_curl(const char *local_file,
     return SUCCESS;
 }
 
+/* 取路径的文件名部分，用作归档内的成员名。
+ * libgen 的 basename() 会修改入参，所以先 strdup 再调（与 init 里用 dirname 同样处理）。
+ * 路径异常（NULL / 空 / 以 '/' 结尾 / "." / ".."）时退回 fallback，
+ * 避免归档里出现空名或怪名。 */
+static void path_basename_or(const char *path, const char *fallback,
+                             char *out, size_t out_size)
+{
+    char *copy;
+    const char *base;
+
+    if (!out || out_size == 0) {
+        return;
+    }
+
+    copy = path ? strdup(path) : NULL;
+    if (!copy) {
+        snprintf(out, out_size, "%s", fallback ? fallback : "");
+        return;
+    }
+
+    base = basename(copy);
+    if (!base || base[0] == '\0' || strcmp(base, "/") == 0 ||
+        strcmp(base, ".") == 0 || strcmp(base, "..") == 0) {
+        snprintf(out, out_size, "%s", fallback ? fallback : "");
+    } else {
+        snprintf(out, out_size, "%s", base);
+    }
+
+    free(copy);
+}
+
 /* 复制文件。argv 数组传参，不经过 shell（路径来自配置，非北向可控，仍统一走无 shell 路径）。
  * 文本日志轮转时 rename 与 fopen 之间有微秒级窗口，此刻 cp 会拿到 ENOENT，
  * 调用方重试一次即可。 */
@@ -279,6 +310,7 @@ static void* log_upload_thread_func(void *arg)
     char text_snap[400] = {0};
     char tel_snap[400] = {0};
     char pkg_path[400] = {0};
+    char text_name[64] = {0};
     char tel_name[64] = {0};
     char *names[2];
     int name_count = 0;
@@ -306,8 +338,22 @@ static void* log_upload_thread_func(void *arg)
                  st.st_size / (1024.0 * 1024.0));
     }
 
+    /* 归档内的成员名跟随配置的文件名（取 basename），不写死：现场改了 LOG_FILE /
+     * TELEMETRY_LOG_FILE 时，包内名字与实际文件一致，排障时不会因名字对不上而误判。
+     * 路径异常时退回默认名。 */
+    path_basename_or(task->log_file_path, "antenna_mgmt.log", text_name, sizeof(text_name));
+    path_basename_or(task->tel_log_path, "telemetry.bin", tel_name, sizeof(tel_name));
+
+    /* 两个 basename 撞名（例如两个配置指向不同目录下的同名文件）会让快照互相覆盖、
+     * 归档里出现两个同名成员（解包时后者盖前者），文本日志和遥测日志就混了。
+     * 给遥测那个加后缀区分。 */
+    if (strcmp(text_name, tel_name) == 0) {
+        LOG_WARN("Log basenames collide (%s), renaming telemetry member", tel_name);
+        snprintf(tel_name, sizeof(tel_name), "%s.tel", text_name);
+    }
+
     /* 文本日志快照：沿用原来的"先 cp 再传"，避免上传期间文件被写而内容不一致 */
-    snprintf(text_snap, sizeof(text_snap), "%s/antenna_mgmt.log", g_upload_tmp_dir);
+    snprintf(text_snap, sizeof(text_snap), "%s/%s", g_upload_tmp_dir, text_name);
     if (copy_file_quiet(task->log_file_path, text_snap) != 0) {
         LOG_ERROR("Failed to create snapshot of %s", task->log_file_path);
         result = LOG_UPLOAD_FAILED;
@@ -319,13 +365,12 @@ static void* log_upload_thread_func(void *arg)
     /* 遥测日志是可选件：还没有 FPGA 回帧、或模块没起来时它会缺失或为空。
      * 这时只降级为"包里只有文本日志"，不让整次上传失败。 */
     if (stat(task->tel_log_path, &st) == 0 && st.st_size > 0) {
-        snprintf(tel_snap, sizeof(tel_snap), "%s/telemetry.bin", g_upload_tmp_dir);
+        snprintf(tel_snap, sizeof(tel_snap), "%s/%s", g_upload_tmp_dir, tel_name);
         /* 用模块内的快照而不是 cp：它持文件锁复制，与轮转互斥，且快照必然落在
          * 整帧边界上 —— cp 读的是字节流，可能把最后一帧抄一半，得到一个尾部
          * 截断的二进制记录。 */
         if (telemetry_log_snapshot(tel_snap) == SUCCESS) {
             tel_created = true;
-            strncpy(tel_name, "telemetry.bin", sizeof(tel_name) - 1);
             LOG_INFO("Telemetry log snapshot created (%ld bytes)", (long)st.st_size);
         } else {
             LOG_WARN("Telemetry log snapshot failed, packaging text log only");
@@ -336,7 +381,7 @@ static void* log_upload_thread_func(void *arg)
 
     /* 打包 */
     snprintf(pkg_path, sizeof(pkg_path), "%s/log_upload_pkg.tgz", g_upload_tmp_dir);
-    names[name_count++] = "antenna_mgmt.log";
+    names[name_count++] = text_name;
     if (tel_created) {
         names[name_count++] = tel_name;
     }
