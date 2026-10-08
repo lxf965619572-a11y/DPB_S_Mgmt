@@ -13,6 +13,7 @@
   F. 帧头跨两次 write 断开时仍能拼回（扫描循环 remaining==1 的修复）
   G. 帧前灌乱码后仍能重新同步，不丢后续帧
   H. 二进制安全：载荷含 0x00 / 0x0A / EB93 / EB90 / 5555 也不被破坏，且日志里无文本污染
+  I. TELEMETRY_LOG_POLL_SEC 真的可配置：改配置值会改变实际下发间隔
 
 D 的证明方式：把 ALARM_LINK_GRACE_SEC 设为 0（关闭宽限期），并让伪造的 0xEB90 状态帧
 里 link_success_flag 的 bit0-3 全为 0。这样只要状态帧被正确解析并喂给 alarm_periodic_check，
@@ -190,7 +191,8 @@ class Harness:
                         os.write(self.master, status_frame(0x00))
                     continue
                 if msg_id in POLL_LEN:
-                    self.seen_polls.append((msg_id, payload))
+                    # 带时间戳：t_interval 要靠它量真实轮询周期
+                    self.seen_polls.append((time.time(), msg_id, payload))
                     if stop_after_frames is not None and seq >= stop_after_frames:
                         continue
                     seq += 1
@@ -268,13 +270,13 @@ def t_basic(tmp, binary):
     h.serve(4.5)
     h.stop()
 
-    polls = [m for m, _ in h.seen_polls]
+    polls = [m for _, m, _ in h.seen_polls]
     check(polls == POLL_ORDER + POLL_ORDER or
           polls[:3] == POLL_ORDER,
           "轮询命令按 A1/B1/B2 顺序下发", "实际=%s" % polls[:6])
-    check(all(p == b"\x00" for _, p in h.seen_polls) and h.seen_polls,
+    check(all(p == b"\x00" for _, _, p in h.seen_polls) and h.seen_polls,
           "轮询载荷为 1 字节 0x00（与状态查询同构）",
-          "实际=%s" % [p.hex() for _, p in h.seen_polls][:6])
+          "实际=%s" % [p.hex() for _, _, p in h.seen_polls][:6])
     check(len(h.sent_frames) >= 3, "伪造 FPGA 发出了遥测帧", "n=%d" % len(h.sent_frames))
 
     data = h.read_tel()
@@ -345,6 +347,35 @@ def t_split_and_garbage(tmp, binary):
           "%d vs %d" % (len(frames), len(h.sent_frames)))
 
 
+def t_interval(tmp, binary):
+    print("\n[I] 轮询周期可配置：改 TELEMETRY_LOG_POLL_SEC 应改变实际下发间隔")
+    observed = {}
+    for want in (2, 4):
+        h = Harness(binary, os.path.join(tmp, "int%d" % want),
+                    poll_sec=want, grace=0)
+        h.start()
+        h.serve(want * 3 + 1)
+        h.stop()
+
+        # 每轮的第一条都是 A1，用相邻两次 A1 的时间差量周期
+        a1 = [t for t, m, _ in h.seen_polls if m == 0xA1]
+        if not check(len(a1) >= 2, "配置 %ds 时至少观察到两轮" % want,
+                     "只看到 %d 条 A1" % len(a1)):
+            continue
+        gaps = [b - a for a, b in zip(a1, a1[1:])]
+        avg = sum(gaps) / len(gaps)
+        observed[want] = avg
+        # 容差 0.8s：本测试台的 select 粒度是 0.1s，且每轮三条命令之间还有 gap
+        check(abs(avg - want) <= 0.8,
+              "配置 %ds 时实测周期 ≈ %ds" % (want, want),
+              "实测=%.2fs（各次 %s）" % (avg, ["%.2f" % g for g in gaps]))
+
+    if len(observed) == 2:
+        check(observed[2] < observed[4],
+              "2s 与 4s 的实测间隔确实不同 —— 配置真的生效，不是写死的",
+              "2s→%.2fs, 4s→%.2fs" % (observed[2], observed[4]))
+
+
 def t_status_regression_strict(tmp, binary):
     print("\n[D] 0xEB90 回归对照：link_success_flag=0x0F 时不应有 1097 告警")
     h = Harness(binary, os.path.join(tmp, "status"), poll_sec=60, grace=0)
@@ -393,7 +424,7 @@ def main():
     print("二进制: %s\n工作目录: %s" % (binary, tmp))
 
     tests = {"basic": t_basic, "rot": t_rotation, "split": t_split_and_garbage,
-             "status": t_status_regression_strict}
+             "status": t_status_regression_strict, "interval": t_interval}
     for name, fn in tests.items():
         if args.only and args.only != name:
             continue
