@@ -431,6 +431,29 @@ int uart_rs422_recv_frame(uart_rs422_client_t *client,
     return ERROR_TIMEOUT;
 }
 
+int uart_rs422_discard_pending(uart_rs422_client_t *client)
+{
+    if (!client || !client->is_open || client->fd < 0) {
+        return ERROR_INVALID_PARAM;
+    }
+
+    /* 取 recv_mutex：环形缓冲区、frame_ready、received_frame 都由它保护 */
+    pthread_mutex_lock(&client->recv_mutex);
+
+    /* 驱动缓冲（内核） */
+    tcflush(client->fd, TCIOFLUSH);
+
+    /* 用户态环形缓冲区与已组好的完整帧。
+     * 注意 tcflush 清不到这两处 —— 它们在本进程内存里，是此前多帧应答
+     * 积压时真正会残留的地方。 */
+    rBufClear(&g_recv_ctx.rbuf);
+    g_recv_ctx.frame_ready = 0;
+    g_recv_ctx.received_frame_len = 0;
+
+    pthread_mutex_unlock(&client->recv_mutex);
+    return SUCCESS;
+}
+
 int uart_rs422_send_and_wait(uart_rs422_client_t *client,
                               const uint8_t *send_frame, uint32_t send_len,
                               uint8_t *recv_frame, uint32_t recv_buf_size,
@@ -439,6 +462,21 @@ int uart_rs422_send_and_wait(uart_rs422_client_t *client,
     if (!client || !send_frame || !recv_frame || !recv_len) {
         return ERROR_INVALID_PARAM;
     }
+
+    /* 发命令前清场：丢掉上一次事务遗留的接收数据。
+     *
+     * 没有这一步时的故障态（尤其是数据应答 RS422_CMD_DATA_ACK）：上一包超时后
+     * 数据帧被重发、FPGA 应答了两次，第一个应答满足重传，第二个留在环形缓冲区里；
+     * pkfinderParse 一次会把缓冲区里所有完整帧都解析出来、只把最后一帧留在
+     * received_frame，更早那帧被静默丢弃。于是下一次 uart_rs422_recv_frame 会
+     * 直接返回这帧残留应答，被当成下一包的应答。而数据应答只有 result 一个字节、
+     * 没有序号，命令码比对（下面的 expected_cmd）对两包完全相同，挡不住这种错位，
+     * 状态机会基于"FPGA 实际拒绝过的包"继续推进。
+     *
+     * 代价：若 FPGA 对某条命令真的异步补发过一次旧应答，会被一并丢掉 —— 但这正是
+     * 想要的，旧应答对当前事务本来就没有意义。清场在收方也安全：本函数是
+     * "发一条命令、等一条应答"的严格串行语义，清完到发送之间不会插入其他读取。 */
+    uart_rs422_discard_pending(client);
 
     /* 发送帧 */
     int ret = uart_rs422_send_frame(client, send_frame, send_len);

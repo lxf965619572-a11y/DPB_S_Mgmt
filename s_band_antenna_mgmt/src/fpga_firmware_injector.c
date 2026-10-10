@@ -4,7 +4,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <termios.h>  /* 添加此头文件以支持 tcflush 和 TCIFLUSH */
 
 /* 全局注入任务 */
 static fpga_injection_task_t g_injection_task;
@@ -648,8 +647,10 @@ static int handle_transfer_data(fpga_injection_task_t *task)
         return ERROR_GENERAL;
     }
 
-    /* 发送前清空接收缓冲区 */
-    tcflush(task->uart_client->fd, TCIOFLUSH);
+    /* 注：此处原本只有一句 tcflush(fd, TCIOFLUSH)，它只清内核驱动缓冲，
+     * 清不到用户态环形缓冲区（g_recv_ctx.rbuf）与已组好的完整帧，容易让人误以为
+     * 接收路径已经清干净。清理已下沉到 uart_rs422_send_and_wait 内部，
+     * 每次事务开始时统一做（见 uart_rs422_discard_pending）。 */
 
     /* 发送数据帧并等待应答 */
     uint8_t recv_buf[256];

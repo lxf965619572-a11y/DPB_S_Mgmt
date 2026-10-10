@@ -83,6 +83,18 @@ int uart_rs422_send_and_wait(uart_rs422_client_t *client,
                               uint32_t *recv_len, uint16_t expected_cmd);
 
 /**
+ * @brief 丢弃所有尚未消费的接收数据（驱动缓冲 + 用户态环形缓冲区）
+ *
+ * 用于在发起一次新的"发送-应答"事务之前清场。RS-422 上每个命令的应答
+ * （尤其是数据应答 RS422_CMD_DATA_ACK）只带一个 result 字节，没有任何
+ * 序号/索引可供与请求关联，因此一旦上次事务遗留的应答帧还留在缓冲区里，
+ * 就会被当作下一次事务的应答返回，造成整条传输错位。
+ * @param client 客户端结构
+ * @return 成功返回SUCCESS
+ */
+int uart_rs422_discard_pending(uart_rs422_client_t *client);
+
+/**
  * @brief 设置超时时间
  * @param client 客户端结构
  * @param timeout_ms 超时时间(毫秒)
