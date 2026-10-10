@@ -80,13 +80,212 @@ static int calculate_sha256(const char *file_path, char *checksum_hex)
     return SUCCESS;
 }
 
+/* 成员数上限。正常版本包只有个位数成员；设上限顺便保证 tar -t 列表不会
+ * 撑爆下面的 64KB 缓冲（截断会被判为异常而拒收）。 */
+#define TAR_MAX_MEMBERS  4096
+
+static int verify_tar_members(const char *tar_path);
+static int check_tar_member_types(const char *tar_path);
+
+/* 解压前检查压缩包的全部成员名。
+ *
+ * 这是"解压前置校验"的落点：verify_bin_file_checksum 的期望值是从**解压出来的**
+ * 目录里读的（见 read_checksum_from_txt），比对的是"包里的文件"与"包里自带的期望值"，
+ * 只能发现传输损坏，且必须在解压之后才能做 —— 指望它拦住恶意压缩包是错的。
+ * 压缩包的内容在解压前没有可信参照，但**成员名**可以先看：成员名里的 '..' 是唯一
+ * 能在写入发生前判定的穿越特征。
+ * 用 -t 只列目录、不解压，读到的是一行一个成员名（tar 默认已加 --quoting-style=escape
+ * 转义特殊字符，这里再拒一次控制字符以防实现差异）。
+ *
+ * 边界（实测 GNU tar 的行为，勿误判防护范围）：
+ *   - 含 '..' 的成员，GNU tar 自己就会拒绝并整体失败（1.29 与 1.35 均如此，
+ *     不写任何文件）；开头的 '/' 和 '../' 也会被 tar 剥掉。所以这一层在 GNU tar 上
+ *     主要是冗余兜底，真正起作用的是换了 tar 实现（busybox/BSD）或旧版本时。
+ *   - 【本函数的已知盲区】`tar -t` 只打印成员**名字**，链接成员的目标（linkname）
+ *     根本不出现。于是这样的成员名全部合法、能穿过本函数：
+ *         lib            （实为 lib -> /etc 的符号链接）
+ *         data           （实为硬链接 etc/passwd）
+ *     而 GNU tar 确实会把这个指向外部的符号链接创建出来（实测 exit=0）。
+ *     真正挡住"后续成员经该链接向外写"的是 tar 默认不跟随目录符号链接，
+ *     不是本函数；本函数对链接成员不提供任何保证。
+ *   - 链接成员盲区由紧接的第二遍扫描（check_tar_member_types）负责关掉：
+ *     它只放行普通文件与目录。 */
+static int verify_tar_members(const char *tar_path)
+{
+    /* 成员列表缓冲。容量要能装下正常版本包的全部成员名；超过即视为异常
+     * （见下方截断判断），不做静默截断处理 —— 否则被截断的那个成员名
+     * 恰好可能藏住 '..'。 */
+    const size_t list_cap = 64 * 1024;
+    char *argv[] = { (char *)"tar", (char *)"-tzf", (char *)tar_path, NULL };
+    char *out = (char *)malloc(list_cap);
+    if (!out) {
+        LOG_ERROR("Failed to alloc buffer for tar member list");
+        return ERROR_GENERAL;
+    }
+
+    int status = shell_run(argv, out, list_cap);
+    if (status < 0) {
+        LOG_ERROR("Failed to list tar members: %s", tar_path);
+        free(out);
+        return ERROR_GENERAL;
+    }
+    if (status != 0) {
+        LOG_ERROR("tar -t failed (status=%d) for %s", status, tar_path);
+        free(out);
+        return ERROR_GENERAL;
+    }
+    /* shell_run 在缓冲满时继续排空管道但丢弃多余输出，不告知是否截断。
+     * 缓冲被填满说明列表可能不完整，无法保证每个成员名都校验过 → 拒绝。 */
+    if (strlen(out) >= list_cap - 1) {
+        LOG_ERROR("tar member listing too large (>= %zu bytes), rejecting: %s",
+                  list_cap, tar_path);
+        free(out);
+        return ERROR_GENERAL;
+    }
+
+    int ret = SUCCESS;
+    uint32_t scanned = 0;
+    char *saveptr = NULL;
+    for (char *line = strtok_r(out, "\n", &saveptr); line != NULL;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        scanned++;
+        /* 条目数上限：正常版本包只有个位数成员（可执行文件 + metadata.txt
+         * + 少量依赖库）。设上限是为了保证成员列表一定装得进上面的缓冲 ——
+         * 否则一个条目极多的大包会被 64KB 截断判断拒掉，那本是合法包。 */
+        if (scanned > TAR_MAX_MEMBERS) {
+            LOG_ERROR("Archive has more than %u members, rejecting: %s",
+                      (unsigned)TAR_MAX_MEMBERS, tar_path);
+            ret = ERROR_GENERAL;
+            break;
+        }
+        if (!shell_safe_tar_member(line)) {
+            /* 这里把成员名原样打进日志：它正是需要被审计下来的东西。
+             * 但先按可见字符替换控制字符，避免它伪造日志行。 */
+            for (char *c = line; *c; c++) {
+                unsigned char u = (unsigned char)*c;
+                if (u < 0x20 || u == 0x7f) {
+                    *c = '?';
+                }
+            }
+            LOG_ERROR("SECURITY ALERT: unsafe tar member rejected: '%s' (archive=%s)",
+                      line, tar_path);
+            ret = ERROR_GENERAL;
+            break;
+        }
+    }
+    free(out);
+
+    /* 一个成员都没有说明这不是个有效压缩包（tar -t 会返回 0） */
+    if (ret == SUCCESS && scanned == 0) {
+        LOG_ERROR("Archive contains no members, rejecting: %s", tar_path);
+        ret = ERROR_GENERAL;
+    }
+
+    if (ret == SUCCESS) {
+        LOG_INFO("Tar member check passed (%u entries): %s", scanned, tar_path);
+        ret = check_tar_member_types(tar_path);
+    }
+    return ret;
+}
+
+/* 第二遍扫描：只放行"普通文件"与"目录"，其余成员类型一律拒绝。
+ *
+ * 这一层专治上面 verify_tar_members 的盲区。`tar -t` 只打印成员**名字**，
+ * 链接成员的目标不出现，于是 lib -> /etc 这类符号链接可以用完全正常的名字
+ * 穿过名字校验，而 GNU tar 确实会把它创建出来（实测 exit=0）。
+ * 正式版本包只有"可执行文件 + metadata.txt + 少量依赖库 + 目录"（见
+ * docs/VERSION_MANAGEMENT.md），不含任何链接，所以这里只放行文件与目录是安全的。
+ *
+ * 实现上刻意**不解析**成员名与链接目标：tar -tv 的 -rw-r--r-- ... 段里名字之后
+ * 还有 " -> 目标" / " link to 目标" 等后缀，去解析它容易引入新的解析漏洞。
+ * 这里只看每行**第一个字符**给出的成员类型（tar 的类型字符取自
+ * "-bcdhlps" 这组，其中 'l' 符号链接、'h' 硬链接恰好都被 tar 用 !isalpha 挡掉、
+ * 不可能出现在名字首字符 —— 所以按行首判类型不会与名字混淆）：
+ *   '-' 普通文件、'd' 目录 = 放行；
+ *   其余（'l' 符号链接、'h' 硬链接、'b'/'c' 设备、'p' 管道、's'/'?' 等）= 拒绝。 */
+static int check_tar_member_types(const char *tar_path)
+{
+    const size_t list_cap = 64 * 1024;
+    char *argv[] = { (char *)"tar", (char *)"-tvzf", (char *)tar_path, NULL };
+    char *out = (char *)malloc(list_cap);
+    if (!out) {
+        LOG_ERROR("Failed to alloc buffer for tar type list");
+        return ERROR_GENERAL;
+    }
+
+    int status = shell_run(argv, out, list_cap);
+    if (status < 0 || status != 0) {
+        LOG_ERROR("tar -tv failed (status=%d) for %s", status, tar_path);
+        free(out);
+        return ERROR_GENERAL;
+    }
+    if (strlen(out) >= list_cap - 1) {
+        LOG_ERROR("tar -tv output too large (>= %zu bytes), rejecting: %s",
+                  list_cap, tar_path);
+        free(out);
+        return ERROR_GENERAL;
+    }
+
+    int ret = SUCCESS;
+    uint32_t scanned = 0;
+    char *saveptr = NULL;
+    for (char *line = strtok_r(out, "\n", &saveptr); line != NULL;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        /* tar 会往输出里混入告警（如 "Removing leading `/'..."），它们以 "tar:"
+         * 开头。用"第 2 列是否为权限位 rwx-"来识别真正的条目行：权限串的第 2 列
+         * 必然是属主读位（'r' 或 '-'），而告警行的第 2 列是 'a'。 */
+        if (line[1] != 'r' && line[1] != 'w' && line[1] != 'x' && line[1] != '-') {
+            continue;
+        }
+
+        scanned++;
+        /* 只放行普通文件 '-' 与目录 'd'。其余一律拒绝 —— 包括 'l'/'h' 链接、
+         * 'b'/'c' 设备、'p' 管道，以及任何未预期的类型字符（fail-closed）。 */
+        if (line[0] != '-' && line[0] != 'd') {
+            const char *tname = "unknown/unsupported";
+            switch (line[0]) {
+                case 'l': tname = "symbolic link"; break;
+                case 'h': tname = "hard link"; break;
+                case 'b': tname = "block device"; break;
+                case 'c': tname = "char device"; break;
+                case 'p': tname = "fifo"; break;
+                case 's': tname = "socket"; break;
+            }
+            LOG_ERROR("SECURITY ALERT: rejected tar member of type '%c' (%s) "
+                      "in %s - only regular files and directories are allowed",
+                      line[0], tname, tar_path);
+            ret = ERROR_GENERAL;
+            break;
+        }
+    }
+    free(out);
+
+    if (ret == SUCCESS && scanned == 0) {
+        LOG_ERROR("tar -tv produced no parseable entries, rejecting: %s", tar_path);
+        ret = ERROR_GENERAL;
+    }
+    if (ret == SUCCESS) {
+        LOG_INFO("Tar member type check passed (%u entries, files/dirs only): %s",
+                 scanned, tar_path);
+    }
+    return ret;
+}
+
 /* 解压tar文件 */
 static int extract_tar_file(const char *tar_path, const char *dest_dir)
 {
+    /* 先做成员名校验，任何一条不通过就不解压 */
+    if (verify_tar_members(tar_path) != SUCCESS) {
+        return ERROR_GENERAL;
+    }
+
     /* 用 argv 数组传参，不经过 shell：
-     * tar_path / dest_dir 均由北向报文字段拼成，走 shell 会被 $() 与反引号注入。 */
+     * tar_path / dest_dir 均由北向报文字段拼成，走 shell 会被 $() 与反引号注入。
+     * --no-same-owner：不让包里的 uid/gid 覆盖解压文件的属主（本服务以 root 运行，
+     * 否则包内成员可声明属主，影响后续以 root 身份执行的版本切换与上注）。 */
     char *argv[] = { (char *)"tar", (char *)"-xzf", (char *)tar_path,
-                     (char *)"-C", (char *)dest_dir, NULL };
+                     (char *)"-C", (char *)dest_dir,
+                     (char *)"--no-same-owner", NULL };
 
     LOG_INFO("Extracting tar file: %s -> %s", tar_path, dest_dir);
 
@@ -725,6 +924,21 @@ static void* version_download_thread_func(void *arg)
     if (task->ver_type == VERSION_TYPE_FIRMWARE) {
         /* 固件版本：从 metadata.txt 读取版本号 */
         if (load_version_metadata(task->version, &metadata) == SUCCESS && metadata.version[0] != '\0') {
+            /* 【关键】metadata.version 来自压缩包内解出的 metadata.txt/version.json
+             * （见 load_version_metadata 的 %39[^"] 与 key=value 两条解析路径，两者都
+             * 原样接受 '/' 和 '.'）。它随后被拼进 new_version_dir，交给 rm -rf 并用于
+             * rename —— 这是二阶注入面：压缩包本身来自北向指定的下载路径，
+             * 在此处若不过滤，一个 version=../../../etc 的包就能命令 rm -rf 打到
+             * /opt/vendor/versions/ 之外。此处与入站处同样过 shell_safe_name，
+             * 不通过就保留临时版本号（目录名仍是受校验的 task->version）。 */
+            if (!shell_safe_name(metadata.version)) {
+                LOG_ERROR("SECURITY ALERT: unsafe version in package metadata, "
+                          "rejected: '%s' (keeping temp version '%s')",
+                          metadata.version, task->version);
+                strncpy(metadata.version, task->version, sizeof(metadata.version) - 1);
+                metadata.version[sizeof(metadata.version) - 1] = '\0';
+            }
+
             /* 如果从 metadata.txt 读取的版本号与临时版本号不同，需要重命名目录 */
             if (strcmp(metadata.version, task->version) != 0) {
                 char new_version_dir[512];
@@ -1041,17 +1255,36 @@ int version_handle_download_request(const cpri_message_t *msg)
     g_download_task.file_len = ie_req->file_len;
     g_download_task.ver_type = ie_req->ver_type;
 
-    /* 校验北向可控的名称字段。它们会被拼进本地路径并交给 tar/rm：
-     *   - 含 '/' 或 ".." 可穿越出 /opt/vendor/versions/ 之外（如 rm -rf ../../..）；
-     *   - 为空会让 version_dir 退化成 VERSION_BASE_DIR 本身，进而把整个版本目录删掉。
-     * 两者都必须拒绝。 */
+    /* 校验北向可控的字段。它们会被拼进 FTP URL、本地路径并交给 tar/rm：
+     *   - version/file_name 含 '/' 或 ".." 可穿越出 /opt/vendor/versions/ 之外
+     *     （如 rm -rf ../../..）；为空会让 version_dir 退化成 VERSION_BASE_DIR 本身，
+     *     进而把整个版本目录删掉。
+     *   - file_path 直接拼进 FTP URL，同样必须挡住 '..'（可让 curl 写到别处）
+     *     与控制字符（换行可截断 URL/伪造日志行）。file_path 允许为空
+     *     （表示 FTP 根目录），这也是原代码支持的用法。 */
     if (!shell_safe_name(g_download_task.version) ||
-        !shell_safe_name(g_download_task.file_name)) {
-        LOG_ERROR("Rejected version download: unsafe name (version='%s', file_name='%s')",
-                  g_download_task.version, g_download_task.file_name);
+        !shell_safe_name(g_download_task.file_name) ||
+        (g_download_task.file_path[0] != '\0' &&
+         !shell_safe_relpath(g_download_task.file_path))) {
+        LOG_ERROR("Rejected version download: unsafe field "
+                  "(version='%s', file_name='%s', file_path='%s')",
+                  g_download_task.version, g_download_task.file_name,
+                  g_download_task.file_path);
         send_version_download_result(&msg->header, ie_req->ver_type, DOWNLOAD_RESULT_OTHER);
         /* 闸门在此处已置位（见函数开头的持锁区间），提前返回必须放闸，
          * 否则后续所有下载请求都会被"already in progress"永久拒绝。 */
+        pthread_mutex_lock(&g_download_mutex);
+        g_download_task.in_progress = false;
+        pthread_mutex_unlock(&g_download_mutex);
+        return ERROR_INVALID_PARAM;
+    }
+
+    /* 下载线程把 file_len 与落地文件大小做一致性比对，这里是唯一的来源，
+     * 只做量级合理性检查，避免明显离谱的值（如 32 位回绕）被当成正常值记录。 */
+    if (g_download_task.file_len > MAX_IMAGE_BYTES) {
+        LOG_ERROR("Rejected version download: file_len too large (%u > %u)",
+                  g_download_task.file_len, (unsigned)MAX_IMAGE_BYTES);
+        send_version_download_result(&msg->header, ie_req->ver_type, DOWNLOAD_RESULT_TOO_LARGE);
         pthread_mutex_lock(&g_download_mutex);
         g_download_task.in_progress = false;
         pthread_mutex_unlock(&g_download_mutex);

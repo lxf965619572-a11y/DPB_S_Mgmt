@@ -108,6 +108,39 @@ int main(void)
         CHECK(!shell_safe_relpath("../../etc"), "路径穿越被拒");
         CHECK(!shell_safe_relpath("logs/../../etc"), "中间段 '..' 被拒");
         CHECK(!shell_safe_relpath(""), "空串被拒");
+        CHECK(!shell_safe_relpath("logs/evil\n../x"), "含换行被拒（可伪造日志行/截断 URL）");
+        CHECK(!shell_safe_relpath("logs/a\tb"), "含制表符被拒");
+    }
+
+    printf("=== 6. shell_safe_tar_member ===\n");
+    {
+        /* 正常成员 */
+        CHECK(shell_safe_tar_member("antenna_mgmt"), "普通文件通过");
+        CHECK(shell_safe_tar_member("bin/antenna_mgmt"), "子目录文件通过");
+        CHECK(shell_safe_tar_member("bin/"), "目录成员（结尾 '/'）通过");
+        CHECK(shell_safe_tar_member("./bin/x"), "单点段 './' 通过");
+        CHECK(shell_safe_tar_member("v1.0.0/lib/libssl.so"), "含点号路径通过");
+
+        /* 穿越与绝对路径 */
+        CHECK(!shell_safe_tar_member(""), "空串被拒");
+        CHECK(!shell_safe_tar_member("../../etc/pwned"), "前导 '..' 被拒");
+        CHECK(!shell_safe_tar_member("a/../../etc/pwned"), "中间段 '..' 被拒（tar 可能不拦）");
+        CHECK(!shell_safe_tar_member("./../pwned"), "'./..' 被拒");
+        CHECK(!shell_safe_tar_member("a/.."), "结尾段 '..' 被拒");
+        CHECK(!shell_safe_tar_member("/etc/pwned"), "绝对路径被拒");
+        CHECK(!shell_safe_tar_member(".."), "整体 '..' 被拒");
+
+        /* 控制字符：换行成员名（tar 会转义成字面 \n，但换 tar 实现就可能漏） */
+        CHECK(!shell_safe_tar_member("evil\n../../etc/x"), "含换行被拒");
+        CHECK(!shell_safe_tar_member("evil\rx"), "含回车被拒");
+
+        /* 超长 */
+        {
+            char longname[300];
+            memset(longname, 'a', sizeof(longname) - 1);
+            longname[sizeof(longname) - 1] = '\0';
+            CHECK(!shell_safe_tar_member(longname), "超长(>255)被拒");
+        }
     }
 
     printf("\n==== %s（失败 %d 项）====\n", failures == 0 ? "全部通过" : "存在失败", failures);

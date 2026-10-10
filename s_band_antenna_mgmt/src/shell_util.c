@@ -124,8 +124,60 @@ bool shell_safe_relpath(const char *path)
         return false;
     }
 
+    /* 控制字符（含 \n、\r、\t）一律拒绝：该值会进 FTP URL 与日志，
+     * 一个换行足以伪造出一条日志记录，或把 URL 从中间截断。 */
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)path[i];
+        if (c < 0x20 || c == 0x7f) {
+            return false;
+        }
+    }
+
     /* 逐段检查：任何一段为 ".." 即拒绝（阻断 ../../ 穿越） */
     const char *p = path;
+    while (*p != '\0') {
+        const char *seg_end = strchr(p, '/');
+        size_t seg_len = seg_end ? (size_t)(seg_end - p) : strlen(p);
+
+        if (seg_len == 2 && p[0] == '.' && p[1] == '.') {
+            return false;
+        }
+
+        if (!seg_end) {
+            break;
+        }
+        p = seg_end + 1;
+    }
+
+    return true;
+}
+
+bool shell_safe_tar_member(const char *member)
+{
+    if (!member || member[0] == '\0') {
+        return false;
+    }
+
+    /* 绝对路径：GNU tar 虽然会剥掉开头的 '/'，但依赖对方的剥法不如直接拒收 */
+    if (member[0] == '/') {
+        return false;
+    }
+
+    size_t len = strlen(member);
+    if (len > 255) {
+        return false;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)member[i];
+        if (c < 0x20 || c == 0x7f) {
+            return false;
+        }
+    }
+
+    /* 逐段检查：任何一段为 ".." 即拒绝。结尾的 '/' 会产生一个空段，
+     * 空段直接跳过（目录成员正常形如 "a/b/"）。 */
+    const char *p = member;
     while (*p != '\0') {
         const char *seg_end = strchr(p, '/');
         size_t seg_len = seg_end ? (size_t)(seg_end - p) : strlen(p);

@@ -50,6 +50,10 @@
 #define MAX_FILEPATH_LEN            200
 #define MAX_TIMESTAMP_LEN           20
 
+/* 单个版本镜像的合理上限。北向报文的 file_len 是 uint32_t，超过这个量级的
+ * 值不可能是真实镜像（且会影响落地文件大小的比对），在下发请求处直接拒绝。 */
+#define MAX_IMAGE_BYTES             (256u * 1024u * 1024u)
+
 /* IE 14: 软件版本核对结果（用于下载请求） */
 typedef struct __attribute__((packed)) {
     cpri_ie_header_t header;
