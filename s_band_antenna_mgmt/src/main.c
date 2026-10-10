@@ -545,6 +545,12 @@ cleanup:
      * 顺带放在 telemetry_log_destroy 之后：上传打包要读遥测日志文件。 */
     log_upload_destroy();
 
+    /* version_manager 的下载线程同样会调 tcp_client_send（下载完成时发结果指示），
+     * 所以也要在 TCP 拆卸之前置它的退出标志。原先本函数排在 tcp_client_destroy
+     * 之后，标志加在 destroy 里也来不及。它不 join（detached + curl 可能跑 600 秒），
+     * 只缩小竞态窗口，与 log_upload 同一取舍。 */
+    version_manager_destroy();
+
     tcp_client_stop(&g_tcp_client);
     tcp_client_destroy(&g_tcp_client);
     uart_client_close(&g_uart_client);
@@ -552,7 +558,6 @@ cleanup:
     fpga_handler_destroy();
     heartbeat_destroy();
     alarm_manager_destroy();
-    version_manager_destroy();
     alarm_query_cleanup();
     loopback_cleanup();
     reset_cleanup();

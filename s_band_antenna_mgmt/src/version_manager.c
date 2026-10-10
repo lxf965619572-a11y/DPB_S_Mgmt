@@ -19,6 +19,12 @@ static version_download_task_t g_download_task;
 static pthread_t g_download_thread;
 static pthread_mutex_t g_download_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* 进程退出标志。与 log_upload 的 g_upload_stopping 同一用途：下载线程是 detached
+ * 的、且 curl 的 --max-time 是 600 秒，destroy 里 join 会把退出流程卡住十分钟，
+ * 所以只能靠这个标志让线程在发 TCP 报文前收手 —— 否则它可能在 tcp_client 拆卸、
+ * send_mutex 被销毁之后仍去锁它（见 version_manager_destroy）。 */
+static volatile bool g_shutting_down = false;
+
 /* 当前版本信息 */
 static char g_current_version[MAX_VERSION_LEN] = {0};
 
@@ -1006,8 +1012,13 @@ static void* version_download_thread_func(void *arg)
     LOG_INFO("Version %s downloaded and installed successfully", task->version);
 
 send_result:
-    /* 发送下载结果指示 */
-    send_version_download_result(&task->req_header, task->ver_type, result);
+    /* 发送下载结果指示。进程正在退出时不再发：此刻 tcp_client 可能已销毁，
+     * 发出去也只会锁到已销毁的 send_mutex。结果指示发不出去无关紧要 —— 进程都要退了。 */
+    if (!g_shutting_down) {
+        send_version_download_result(&task->req_header, task->ver_type, result);
+    } else {
+        LOG_WARN("Shutting down, skip version download result indication (result=%u)", result);
+    }
 
     /* 清除下载中标志 */
     pthread_mutex_lock(&g_download_mutex);
@@ -1536,9 +1547,20 @@ int version_rollback(const char *version, const char *reason)
 
 void version_manager_destroy(void)
 {
+    /* 先置退出标志：下载线程在发 TCP 报文前会检查它，置位后不再发送。
+     *
+     * 【刻意不 join 下载线程】它是 detached 的，且 curl 的 --max-time 是 600 秒，
+     * join 可能把退出流程卡住十分钟。因此这里只缩小竞态窗口、并不消除它：
+     * 线程若已越过那个检查、正处在 tcp_client_send 内部，仍可能撞上已被销毁的
+     * send_mutex。与 log_upload 是同一种取舍。
+     * 必须由调用方（main.c）把本函数排在 tcp_client_stop 之前，置位才会发生在
+     * TCP 拆卸之前 —— 原先它排在 tcp_client_destroy 之后，标志加在这里也来不及。 */
+    g_shutting_down = true;
+
     pthread_mutex_lock(&g_download_mutex);
     if (g_download_task.in_progress) {
-        LOG_WARN("Version download in progress during destroy");
+        LOG_WARN("Version download in progress during destroy, not waiting for it "
+                 "(shutdown flag set, its TCP result will be skipped)");
     }
     pthread_mutex_unlock(&g_download_mutex);
 
