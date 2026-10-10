@@ -196,6 +196,17 @@ static int handle_config_ie(const cpri_message_t *request, cpri_message_t *respo
 
         switch (ie_type) {
             case IE_SYSTEM_TIME_CONFIG: {
+                /* 按被解引用的结构体实际大小设闸：上面的 ie_length 检验只保证
+                 * 长度≥4 且不越过 payload，而本 case 会读满 sizeof(system_time_config_ie_t)
+                 * 个字节。若 IE 只声明了 4 字节，多读的部分属于**下一个 IE** 或
+                 * 内存池里上一条报文的残留数据，会被当成时间字段喂给 settimeofday()。
+                 * 拒收但要标 processed，使应答明确回报失败，而不是静默错配。 */
+                if (ie_length < sizeof(system_time_config_ie_t)) {
+                    LOG_ERROR("IE %u too short for struct: ie_length=%u, need=%zu",
+                              ie_type, ie_length, sizeof(system_time_config_ie_t));
+                    time_processed = true;
+                    break;
+                }
                 const system_time_config_ie_t *ie = (const system_time_config_ie_t *)(data + offset);
                 if (param_config_set_system_time(ie) == SUCCESS) {
                     time_result = CONFIG_RESULT_SUCCESS;
@@ -205,6 +216,12 @@ static int handle_config_ie(const cpri_message_t *request, cpri_message_t *respo
             }
 
             case IE_CPU_PERIOD_CONFIG: {
+                if (ie_length < sizeof(cpu_period_config_ie_t)) {
+                    LOG_ERROR("IE %u too short for struct: ie_length=%u, need=%zu",
+                              ie_type, ie_length, sizeof(cpu_period_config_ie_t));
+                    period_processed = true;
+                    break;
+                }
                 const cpu_period_config_ie_t *ie = (const cpu_period_config_ie_t *)(data + offset);
                 if (param_config_set_cpu_period(ie) == SUCCESS) {
                     period_result = CONFIG_RESULT_SUCCESS;
@@ -214,6 +231,12 @@ static int handle_config_ie(const cpri_message_t *request, cpri_message_t *respo
             }
 
             case IE_CPRI_WORK_MODE_CONFIG: {
+                if (ie_length < sizeof(cpri_work_mode_config_ie_t)) {
+                    LOG_ERROR("IE %u too short for struct: ie_length=%u, need=%zu",
+                              ie_type, ie_length, sizeof(cpri_work_mode_config_ie_t));
+                    mode_processed = true;
+                    break;
+                }
                 const cpri_work_mode_config_ie_t *ie = (const cpri_work_mode_config_ie_t *)(data + offset);
                 if (param_config_set_cpri_mode(ie) == SUCCESS) {
                     mode_result = CONFIG_RESULT_SUCCESS;

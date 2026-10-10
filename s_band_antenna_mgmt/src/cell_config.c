@@ -43,6 +43,11 @@ static cell_cfg_job_t  *g_job_queue[CELL_CFG_JOB_QUEUE_LEN];
 static int              g_job_head = 0;
 static int              g_job_tail = 0;
 static int              g_job_count = 0;
+
+/* 前向声明：cell_config_send_busy_response 在文件前部就要用 add_ie，
+ * 而它的定义在后面的响应构造区 */
+static int add_ie(uint8_t **payload, uint32_t *offset, uint16_t ie_type,
+                  const uint8_t *ie_data, uint16_t ie_data_len);
 static pthread_mutex_t  g_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   g_job_cond  = PTHREAD_COND_INITIALIZER;
 static pthread_t        g_job_thread;
@@ -111,6 +116,74 @@ static void *cell_cfg_worker(void *arg)
     return NULL;
 }
 
+/* 队列已满、无法入队时，给 BBU 回一个明确的失败响应。
+ *
+ * 原行为是直接丢包并只打日志 —— BBU 一直在等一个永不到来的
+ * MSG_NR_CELL_CONFIG_RSP。worker 单次最长会阻塞 5 秒（天线模式校验），
+ * 队列只有 8 格，BBU 重试风暴下很容易撞满。这里按请求里的 IE 逐个回失败，
+ * 不解析也不应用任何配置（本地 cell_id/beam_id 填 0 占位），
+ * 只把"本设备当前处理不了"如实告诉对端，让它可以稍后重试。 */
+static void cell_config_send_busy_response(const cpri_message_t *msg)
+{
+    if (!msg || !msg->payload) {
+        return;
+    }
+
+    uint8_t *payload = NULL;
+    uint32_t offset = 0;
+    uint32_t req_offset = 0;
+
+    while (req_offset + 4 <= msg->payload_len) {
+        uint16_t ie_type, ie_len;
+        memcpy(&ie_type, msg->payload + req_offset, 2);
+        memcpy(&ie_len, msg->payload + req_offset + 2, 2);
+
+        if (ie_len < 4 || req_offset + ie_len > msg->payload_len) {
+            break;
+        }
+
+        if (ie_type == IE_TYPE_CELL_CONFIG) {
+            uint8_t resp[8];
+            memset(resp, 0, sizeof(resp));
+            memcpy(resp + 4, &(uint32_t){ CONFIG_RESULT_FAILURE }, 4);
+            add_ie(&payload, &offset, IE_TYPE_CELL_CONFIG_RESP, resp, sizeof(resp));
+        } else if (ie_type == IE_TYPE_FREQ_CONFIG) {
+            uint8_t resp[9];
+            memset(resp, 0, sizeof(resp));
+            memcpy(resp + 5, &(uint32_t){ CONFIG_RESULT_FAILURE }, 4);
+            add_ie(&payload, &offset, IE_TYPE_FREQ_CONFIG_RESP, resp, sizeof(resp));
+        }
+
+        req_offset += ie_len;
+    }
+
+    if (!payload || offset == 0) {
+        free(payload);
+        return;
+    }
+
+    cpri_message_t response;
+    memset(&response, 0, sizeof(response));
+    response.header.msg_id     = MSG_NR_CELL_CONFIG_RSP;
+    response.header.paau_id    = msg->header.paau_id;
+    response.header.bbu_id     = msg->header.bbu_id;
+    response.header.port_num   = msg->header.port_num;
+    response.header.serial_num = msg->header.serial_num;
+    response.payload           = payload;
+    response.payload_len       = offset;
+
+    uint8_t buffer[CELL_CFG_RESP_BUF_SIZE];
+    int len = cpri_encode_message(&response, buffer, sizeof(buffer));
+    if (len > 0) {
+        tcp_client_send(&g_tcp_client, buffer, len);
+        LOG_WARN("Sent cell config BUSY/failure response (serial=%u, payload_len=%u)",
+                 response.header.serial_num, offset);
+    } else {
+        LOG_ERROR("Failed to encode busy response (serial=%u)", msg->header.serial_num);
+    }
+    free(payload);
+}
+
 /* 接收线程调用：深拷贝请求并入队，立即返回（不阻塞） */
 int cell_config_submit_request(const cpri_message_t *msg)
 {
@@ -145,6 +218,10 @@ int cell_config_submit_request(const cpri_message_t *msg)
         pthread_mutex_unlock(&g_job_mutex);
         LOG_ERROR("Cell cfg job queue full, request dropped (serial=%u)", job->serial_num);
         cell_cfg_job_free(job);
+        /* 必须回一个失败响应：否则 BBU 会一直等一个不会到来的响应。
+         * 本函数跑在 TCP 接收线程上，但这里只做一次组帧+send，不阻塞
+         * （不能在此队列已满的时刻再去排队或等待）。 */
+        cell_config_send_busy_response(msg);
         return ERROR_GENERAL;
     }
     g_job_queue[g_job_tail] = job;
