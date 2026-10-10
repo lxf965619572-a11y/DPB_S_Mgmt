@@ -150,9 +150,11 @@ void fpga_firmware_injection_cleanup(void)
      * fclose 线程正在读的文件同样如此（且线程退出时会自己关它，属重复关闭）。
      *
      * 现在：请求中止 → 有界等待线程退出 → 确认退出后才 join 并销毁。
-     * 线程的若干长 sleep 不检查 abort（属另一项待修问题），因此不能无限期等；
-     * 等不到就【跳过销毁】——进程随后退出，泄漏一个 mutex 无害，
-     * 对仍被使用的 mutex 调 destroy 才是真问题。 */
+     * 线程内的长等待（sleep(20)、重构轮询 sleep(5)、传输开始 5 分钟轮询）
+     * 现已全部改为 interruptible_sleep 并检查 abort_requested，因此这里的 3 秒
+     * 等待是够用的（线程最迟 100ms 内响应）。仍保留"等不到就跳过销毁"的兜底：
+     * 极端情况下（线程卡在 uart 收发里）对仍被使用的 mutex 调 destroy 才是真问题，
+     * 而进程随后退出，泄漏一个 mutex 无害。 */
     if (g_injection_task.injection_thread != 0) {
         pthread_mutex_lock(&g_injection_task.state_mutex);
         g_injection_task.abort_requested = true;
@@ -218,6 +220,31 @@ static void transition_state(fpga_injection_task_t *task, fpga_injection_state_t
     LOG_INFO("FPGA固件注入状态转换: %s -> %s",
              fpga_injection_get_state_name(old_state),
              fpga_injection_get_state_name(new_state));
+}
+
+/* 可中断的 sleep：按 100ms 分片睡，期间轮询中止标志。
+ *
+ * 必要性：注入线程里有 sleep(20)（子阵擦除等待）和重构轮询的 sleep(5)，
+ * 原实现期间完全不看 abort_requested，导致 fpga_firmware_injection_cleanup
+ * 那 3 秒的等待形同虚设 —— 线程可能在长睡里，cleanup 只好跳过销毁并放弃 join，
+ * 而 main.c 随后仍会拆 uart_rs422（销毁线程可能正在用的 send_mutex）。
+ * 分片后线程能在 100ms 内响应中止，等待才有意义。
+ * 用 usleep 分片而非 sleep：便于控制粒度，且与项目其余等待一致。 */
+static void interruptible_sleep(fpga_injection_task_t *task, uint32_t total_sec)
+{
+    const uint32_t slice_ms = 100;
+    uint32_t elapsed_ms = 0;
+    uint32_t total_ms = total_sec * 1000;
+
+    while (elapsed_ms < total_ms) {
+        if (task->abort_requested) {
+            return;     /* 被要求中止，立即返回，让调用方尽快走退出路径 */
+        }
+        uint32_t remain = total_ms - elapsed_ms;
+        uint32_t s = (remain < slice_ms) ? remain : slice_ms;
+        usleep(s * 1000);
+        elapsed_ms += s;
+    }
 }
 
 /* 注入线程主函数 */
@@ -414,6 +441,13 @@ static int handle_transfer_start(fpga_injection_task_t *task)
     uint8_t result = RS422_TRANSFER_PREPARING;
 
     while (result == RS422_TRANSFER_PREPARING) {
+        /* 取消要能及时生效：本循环最长可轮询 5 分钟（FPGA_TRANSFER_START_TIMEOUT_SEC），
+         * 每次 sleep(1) 若不看中止标志，cleanup 的等待就白等。 */
+        if (task->abort_requested) {
+            LOG_INFO("传输开始轮询期间收到中止请求，退出");
+            transition_state(task, FPGA_INJ_STATE_FAILED);
+            return ERROR_GENERAL;
+        }
         /* 检查超时 */
         if ((time(NULL) - start_time) > FPGA_TRANSFER_START_TIMEOUT_SEC) {
             LOG_ERROR("传输开始超时(5分钟)");
@@ -431,7 +465,7 @@ static int handle_transfer_start(fpga_injection_task_t *task)
 
         if (ret != SUCCESS) {
             LOG_WARN("发送传输开始命令失败,1秒后重试");
-            sleep(1);
+            interruptible_sleep(task, 1);
             continue;
         }
 
@@ -442,14 +476,14 @@ static int handle_transfer_start(fpga_injection_task_t *task)
         ret = rs422_decode_frame(recv_frame, recv_len, &apid, &cmd_code, &payload, &payload_len);
         if (ret != SUCCESS) {
             LOG_ERROR("解码传输开始应答失败");
-            sleep(1);
+            interruptible_sleep(task, 1);
             continue;
         }
 
         ret = rs422_parse_transfer_start_ack(payload, payload_len, &result);
         if (ret != SUCCESS) {
             LOG_ERROR("解析传输开始应答失败");
-            sleep(1);
+            interruptible_sleep(task, 1);
             continue;
         }
 
@@ -457,7 +491,7 @@ static int handle_transfer_start(fpga_injection_task_t *task)
                  rs422_get_result_desc(RS422_CMD_TRANSFER_START_ACK, result), result);
 
         if (result == RS422_TRANSFER_PREPARING) {
-            sleep(1);  /* 继续轮询 */
+            interruptible_sleep(task, 1);  /* 继续轮询 */
         }
     }
 
@@ -476,7 +510,12 @@ static int handle_transfer_start(fpga_injection_task_t *task)
     }
     
     /**子阵擦除完成要等待20s，擦除其他子阵 */
-    sleep(20);
+    interruptible_sleep(task, 20);
+
+    if (task->abort_requested) {
+        transition_state(task, FPGA_INJ_STATE_FAILED);
+        return ERROR_GENERAL;
+    }
 
     task->current_segment = 0;
     task->current_packet_in_segment = 0;
@@ -879,7 +918,7 @@ static int handle_reconfig_polling(fpga_injection_task_t *task)
 
     if (ret != SUCCESS) {
         LOG_WARN("发送重构查询命令失败,继续轮询");
-        sleep(FPGA_RECONFIG_POLL_INTERVAL_SEC);
+        interruptible_sleep(task, FPGA_RECONFIG_POLL_INTERVAL_SEC);
         return ERROR_GENERAL;
     }
 
@@ -890,7 +929,7 @@ static int handle_reconfig_polling(fpga_injection_task_t *task)
     ret = rs422_decode_frame(recv_frame, recv_len, &apid, &cmd_code, &payload, &payload_len);
     if (ret != SUCCESS) {
         LOG_ERROR("解码重构应答失败");
-        sleep(FPGA_RECONFIG_POLL_INTERVAL_SEC);
+        interruptible_sleep(task, FPGA_RECONFIG_POLL_INTERVAL_SEC);
         return ERROR_GENERAL;
     }
 
@@ -898,7 +937,7 @@ static int handle_reconfig_polling(fpga_injection_task_t *task)
     ret = rs422_parse_reconfig_ack(payload, payload_len, &result);
     if (ret != SUCCESS) {
         LOG_ERROR("解析重构应答失败");
-        sleep(FPGA_RECONFIG_POLL_INTERVAL_SEC);
+        interruptible_sleep(task, FPGA_RECONFIG_POLL_INTERVAL_SEC);
         return ERROR_GENERAL;
     }
 
@@ -911,7 +950,7 @@ static int handle_reconfig_polling(fpga_injection_task_t *task)
         return SUCCESS;
     } else if (result == RS422_RECONFIG_IN_PROGRESS) {
         LOG_INFO("FPGA重构中,继续轮询...");
-        sleep(FPGA_RECONFIG_POLL_INTERVAL_SEC);
+        interruptible_sleep(task, FPGA_RECONFIG_POLL_INTERVAL_SEC);
         return SUCCESS;
     } else {
         LOG_ERROR("FPGA重构失败: result=0x%02X", result);

@@ -80,6 +80,12 @@ bool is_transparent_message(uint32_t msg_id)
             msg_id <= MSG_TRANSPARENT_BBU_TO_PAAU_10);
 }
 
+bool is_bbu_to_paau_transparent(uint32_t msg_id)
+{
+    return (msg_id >= MSG_TRANSPARENT_BBU_TO_PAAU_BASE &&
+            msg_id <= MSG_TRANSPARENT_BBU_TO_PAAU_10);
+}
+
 /**
  * 获取透传目标名称
  */

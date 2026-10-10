@@ -128,6 +128,16 @@ int send_transparent_paau_to_bbu(uint16_t msg_id, uint8_t target_id,
  */
 bool is_transparent_message(uint32_t msg_id);
 
+/*
+ * 是否为"BBU -> PAAU"方向的透传消息（231-240）。
+ *
+ * 与 is_transparent_message 的区别：后者对两个方向都为真，而本设备只处理
+ * BBU->PAAU 方向 —— 221-230 是 PAAU 发给 BBU 的方向，入站收到只会被判为
+ * "unexpected direction" 后返回。msg_handler 的白名单应当用本函数，
+ * 否则会把 221-230 也放行成"已受理"，实际却是被丢弃的死路径。
+ */
+bool is_bbu_to_paau_transparent(uint32_t msg_id);
+
 /**
  * 获取透传目标名称
  * @param target_id 目标标识

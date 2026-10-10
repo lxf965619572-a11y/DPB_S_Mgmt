@@ -128,20 +128,28 @@ int msg_handler_init(void)
 }
 
 /* ==================== 入站 msg_id 白名单 ====================
- * 只接受分发表里已登记的消息类型，以及透传区间 221-240。
+ * 只接受分发表里已登记的消息类型，以及透传区间中本设备真正处理的方向
+ * （BBU->PAAU，231-240）。
  *
- * 顺带修掉一处截断：msg_id 在报文头里是 uint32_t，而透传判定的形参原先是 uint16_t，
- * 于是 msg_id = 0x10000 + 221 这类构造会被截断成 221 而被【误路由进透传分支】。
- * 实测（基线二进制）：msg_id=65757 会打出 "Handle transparent message"。
+ * 历史：原先白名单用 is_transparent_message（对 221-240 两个方向都为真），
+ * 会把 PAAU->BBU 方向的 221-230 也放行成"已受理"，而透传处理遇到该方向
+ * 只打 "unexpected direction" 后返回，是条被接受却没有下文的死路径。
+ * 现已收紧为 is_bbu_to_paau_transparent。
  *
- * 定级说明：该误路由【不会】直达 FPGA 写操作——透传处理内部的方向判定用的是完整
- * 32 位值，65757 会落到 "unexpected direction" 分支后返回。任何能通过方向判定的值
- * 本身就已落在 [231,240] 内，截断与否结果相同。所以这是路由缺陷，不是写权限绕过；
- * 但仍应由白名单在入口处挡掉，且透传判据理应与报文头类型保持一致。
+ * 另：透传判定的形参曾是 uint16_t，而 msg_id 在报文头里是 uint32_t，
+ * msg_id = 0x10000 + 221 这类构造会被截断成 221 而误入透传分支。该截断
+ * 已随判据改为 uint32_t 而消失（is_bbu_to_paau_transparent 取 uint32_t）。
+ * 即便存在也不会直达 FPGA 写操作：透传内部的方向判定用完整 32 位值，
+ * 65757 会落到 "unexpected direction" 分支返回。仍由白名单在入口挡掉。
  * ========================================================== */
 static bool msg_id_is_accepted(uint32_t msg_id)
 {
-    if (is_transparent_message(msg_id)) {
+    /* 只放行 BBU->PAAU 方向（231-240）。原先用的是 is_transparent_message，
+     * 它对两个方向都为真，于是 221-230（PAAU->BBU 方向）也被判为"已受理"，
+     * 但后续 transparent_msg_handle 遇到该方向只会打 "unexpected direction"
+     * 后返回 —— 那是条被接受却没有下文的死路径。白名单应收紧到本设备真正
+     * 处理的方向。 */
+    if (is_bbu_to_paau_transparent(msg_id)) {
         return true;
     }
     for (int i = 0; g_msg_handlers[i].handler != NULL; i++) {
