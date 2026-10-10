@@ -21,7 +21,7 @@ S波段天线管理系统是一个用于管理和控制S波段天线阵列的嵌
 ├── _analysis_extract/        # 分析文档提取脚本
 ├── verify_calib.py           # 验证：校准结果查询如实回报（IE 308 -> IE 358）
 ├── verify_log_upload.py      # 验证：日志上传（打包）端到端
-├── verify_msg_id.py          # 验证：msg_id 白名单 + 透传通道开关
+├── verify_msg_id.py          # 验证：msg_id 白名单（含透传方向）+ 透传通道开关
 ├── verify_p1_2.py            # 验证：天线模式校验已不在 TCP 接收线程执行
 ├── verify_paau_id.py         # 验证：入站 paau_id 校验接口
 ├── verify_reconnect.py       # 验证：反复断线重连时接收线程可正确回收

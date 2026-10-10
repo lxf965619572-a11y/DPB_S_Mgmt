@@ -116,6 +116,18 @@ def main():
     results.append(run('msg_id=65536+231 截断构造应被拒', 65536 + 231, {},
                        ['Rejected unknown msg_id'], ['TRANSPARENT']))
 
+    # 透传白名单只应收紧到本设备真正处理的方向（BBU->PAAU，231-240）。
+    # 221-230 是 PAAU->BBU 方向：修复前白名单用 is_transparent_message（两方向
+    # 都为真）会把它放行成"已受理"，随后 handle_transparent_msg 打出
+    # "Handle transparent message"，再落到 "unexpected direction" 后返回 ——
+    # 是条被接受却没有下文的死路径。修复后应在入口就被白名单拒掉。
+    results.append(run('msg_id=221(PAAU->BBU 方向) 应被白名单拒', 221, {},
+                       ['Rejected unknown msg_id'],
+                       ['Handle transparent message', 'unexpected direction']))
+    results.append(run('msg_id=230(PAAU->BBU 方向) 应被白名单拒', 230, {},
+                       ['Rejected unknown msg_id'],
+                       ['Handle transparent message', 'unexpected direction']))
+
     print('\n[透传通道开关]')
     results.append(run('msg_id=231 通道关闭(ENABLE=0)应被拒', 231,
                        {'TRANSPARENT_ENABLE': 0},
