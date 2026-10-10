@@ -1326,6 +1326,35 @@ int version_handle_download_request(const cpri_message_t *msg)
     return SUCCESS;
 }
 
+/* 异步执行服务重启：fork 一个脱离会话的子进程，先睡 3 秒（给 BBU 接收应答留时间），
+ * 再 execvp 执行。
+ *
+ * 改造前这里是 sleep(3) + system("systemctl restart antenna-mgmt.service &")，
+ * 两者都跑在 TCP 接收线程上：3 秒不读 socket 会把 BBU 心跳堵在内核缓冲里
+ * （本项目反复踩过这个坑，cell_config 与 reset 都为此改成了异步），而 system()
+ * 还会拉起一个 shell —— 全项目其余调用点都已改成 shell_run 的 argv 形式，
+ * 只剩这里还是 shell 字符串。本函数与 reset.c 的 reset_schedule_action 同构：
+ * 不经 shell、不在接收线程里 sleep。fork/exec 失败只记日志，不影响已发出的应答。 */
+static void version_schedule_service_restart(void)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        LOG_ERROR("Failed to fork for service restart: %s", strerror(errno));
+        return;
+    }
+
+    if (pid == 0) {
+        setsid();           /* 脱离会话，父进程退出/重启都不影响它 */
+        sleep(3);
+        char *argv[] = { (char *)"systemctl", (char *)"restart",
+                         (char *)"antenna-mgmt.service", NULL };
+        execvp(argv[0], argv);
+        _exit(127);         /* exec 失败 */
+    }
+
+    LOG_INFO("Scheduled service restart in 3 seconds (helper pid=%d)", (int)pid);
+}
+
 int version_handle_activate_request(const cpri_message_t *msg)
 {
     if (!msg || !msg->payload) {
@@ -1349,6 +1378,18 @@ int version_handle_activate_request(const cpri_message_t *msg)
     if (tar_gz_pos) {
         *tar_gz_pos = '\0';
         LOG_INFO("Removed .tar.gz suffix, actual version: %s", version);
+    }
+
+    /* 【关键】version 来自 IE 311 的 version_num，是北向直接可控的字段。
+     * 它随后被拼进 version_dir（"%s/%s"）并用于 stat/lstat/readlink 与目录切换，
+     * 属与下载路径同一类的二阶注入面：含 '/' 或 '..' 可指向 VERSION_BASE_DIR
+     * 之外（如 ../../etc），为空则退化成 VERSION_BASE_DIR 本身。
+     * 与下载入口（version_handle_download_request）用同一个 shell_safe_name 过滤。 */
+    if (!shell_safe_name(version)) {
+        LOG_ERROR("SECURITY ALERT: unsafe version in activate request, rejected: '%s'",
+                  version);
+        send_version_activate_ack(&msg->header, ie_ind->ver_type, ACTIVATE_RESULT_OTHER);
+        return ERROR_INVALID_PARAM;
     }
 
     uint8_t result = ACTIVATE_RESULT_SUCCESS;
@@ -1423,15 +1464,9 @@ int version_handle_activate_request(const cpri_message_t *msg)
                 fclose(fp);
             }
 
-            /* 延迟3秒后重启服务（给BBU时间接收应答） */
-            LOG_INFO("Service will restart in 3 seconds...");
-            sleep(3);
-
-            /* 方式1: 通过systemd重启服务（推荐） */
-            system("systemctl restart antenna-mgmt.service &");
-
-            /* 方式2: 如果需要重启整个系统（谨慎使用） */
-            /* system("shutdown -r +1 'Antenna management software upgrade' &"); */
+            /* 延迟 3 秒后重启服务（给 BBU 时间接收应答）。
+             * 异步执行：不在此线程 sleep，也不经 shell（见 version_schedule_service_restart）。 */
+            version_schedule_service_restart();
         }
     }
 
