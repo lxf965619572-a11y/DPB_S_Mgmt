@@ -286,7 +286,14 @@ int fpga_send_system_time(void)
     fpga_message_t msg;
     uint8_t payload[6];
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
+    /* localtime_r：多线程下避免共享静态 struct tm；并补上原先缺失的失败检查
+     * （原来直接解引用 localtime 的返回值，失败时会崩）。 */
+    struct tm tm_storage;
+    struct tm *tm_info = localtime_r(&now, &tm_storage);
+    if (!tm_info) {
+        LOG_ERROR("localtime_r failed, cannot send system time");
+        return ERROR_GENERAL;
+    }
 
     payload[0] = tm_info->tm_sec;
     payload[1] = tm_info->tm_min;

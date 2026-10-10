@@ -191,7 +191,13 @@ int param_query_handle_system_time(cpri_message_t *response)
     system_time_resp_ie_t ie_data;
 
     time_t currentTime = time(NULL);
-    struct tm *timeInfo = localtime(&currentTime);
+    /* localtime_r：多线程下避免共享静态 struct tm；并补上原先缺失的失败检查 */
+    struct tm tm_storage;
+    struct tm *timeInfo = localtime_r(&currentTime, &tm_storage);
+    if (!timeInfo) {
+        LOG_ERROR("localtime_r failed, cannot build system time response");
+        return ERROR_GENERAL;
+    }
 
     ie_data.second = timeInfo->tm_sec;         // 秒: 0-59
     ie_data.minute = timeInfo->tm_min;         // 分: 0-59

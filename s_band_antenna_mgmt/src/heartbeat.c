@@ -14,6 +14,11 @@ extern tcp_client_t g_tcp_client;
 extern uint32_t g_serial_num;
 extern pthread_mutex_t g_serial_num_mutex;
 
+/* g_heartbeat_mgr.mutex 是否处于"已初始化且未销毁"状态。
+ * main.c 清理时无条件调 heartbeat_destroy()，而 init 可能失败提前返回，
+ * 无保护地 destroy 一个未初始化的互斥量是 UB。 */
+static bool g_heartbeat_mutex_ready = false;
+
 /* 获取下一个流水号（线程安全） */
 static inline uint32_t get_next_serial_num_safe(void)
 {
@@ -32,6 +37,7 @@ int heartbeat_init(void)
         LOG_ERROR("Failed to init heartbeat mutex");
         return ERROR_GENERAL;
     }
+    g_heartbeat_mutex_ready = true;
 
     LOG_INFO("Heartbeat manager initialized");
     return SUCCESS;
@@ -160,6 +166,13 @@ bool heartbeat_check_timeout(void)
 
 void heartbeat_destroy(void)
 {
-    pthread_mutex_destroy(&g_heartbeat_mgr.mutex);
+    /* 只在互斥量确实初始化成功过才销毁。
+     * main.c 的清理是无条件调用本函数的，而 init 有可能在 pthread_mutex_init
+     * 失败时提前返回 —— 那之后销毁一个未初始化的互斥量是 UB。
+     * 与 alarm_manager / fpga_watchdog / cell_config 的 _mutex_ready 保护一致。 */
+    if (g_heartbeat_mutex_ready) {
+        pthread_mutex_destroy(&g_heartbeat_mgr.mutex);
+        g_heartbeat_mutex_ready = false;
+    }
     LOG_INFO("Heartbeat manager destroyed");
 }

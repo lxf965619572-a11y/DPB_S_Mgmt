@@ -225,9 +225,14 @@ int fpga_to_cpri_alarm_report(const fpga_status_frame_t *fpga_status, cpri_messa
     uint32_t alarm_clear = 0;  /* 0=产生告警 */
     memcpy(alarm_data + 10, &alarm_clear, 4);
 
-    /* 时间戳 */
+    /* 时间戳（localtime_r：多线程下避免共享静态 struct tm） */
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
+    struct tm tm_storage;
+    struct tm *tm_info = localtime_r(&now, &tm_storage);
+    if (!tm_info) {
+        LOG_ERROR("localtime_r failed");
+        return ERROR_GENERAL;
+    }
     char timestamp[20];
     snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d%02d%02d%02d",
              tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,

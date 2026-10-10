@@ -148,11 +148,14 @@ int reset_parse_indication(const uint8_t *data, size_t len,
     memset(result, 0, sizeof(*result));
     result->msg_id = MSG_RESET_IND;
 
-    /* 获取当前时间戳 */
+    /* 获取当前时间戳（localtime_r：多线程下避免共享静态 struct tm） */
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    strftime(result->timestamp, sizeof(result->timestamp),
-             "%Y-%m-%d %H:%M:%S", tm_info);
+    struct tm tm_storage;
+    struct tm *tm_info = localtime_r(&now, &tm_storage);
+    if (tm_info) {
+        strftime(result->timestamp, sizeof(result->timestamp),
+                 "%Y-%m-%d %H:%M:%S", tm_info);
+    }
 
     /* 解析IE数据 */
     const ie_reset_ind_t *ind = (const ie_reset_ind_t *)data;

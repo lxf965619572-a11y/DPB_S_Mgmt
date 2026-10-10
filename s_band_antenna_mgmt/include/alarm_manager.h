@@ -20,6 +20,7 @@
 #define ALARM_CODE_VERSION_ACTIVATE_FAIL 1158   /* 版本激活失败 */
 #define ALARM_CODE_CHANNEL_FAULT_EXCEED  1159   /* 通道故障过多 */
 #define ALARM_CODE_TCP_DISCONNECT      1160     /* TCP连接断开告警(自定义) */
+#define ALARM_CODE_WATCHDOG_FEED_FAIL  1161     /* FPGA看门狗喂狗失败(自定义) */
 
 /* 告警有效性 */
 #define ALARM_VALIDITY_VALID    0    /* 告警有效 */

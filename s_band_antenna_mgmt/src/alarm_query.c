@@ -88,10 +88,13 @@ int send_alarm_report_from_record(const cpri_msg_header_t *req_header,
     report_ie.sub_code = (record->sub_code);
     report_ie.clear_flag = (record->active ? ALARM_CLEAR_FLAG_ACTIVE : ALARM_CLEAR_FLAG_CLEARED);
 
-    /* 格式化时间戳 */
-    struct tm *tm_info = localtime(&record->start_time);
-    strftime(report_ie.timestamp, sizeof(report_ie.timestamp),
-             "%Y-%m-%d %H:%M:%S", tm_info);
+    /* 格式化时间戳（localtime_r：多线程下避免共享静态 struct tm） */
+    struct tm tm_storage;
+    struct tm *tm_info = localtime_r(&record->start_time, &tm_storage);
+    if (tm_info) {
+        strftime(report_ie.timestamp, sizeof(report_ie.timestamp),
+                 "%Y-%m-%d %H:%M:%S", tm_info);
+    }
 
     /* 复制附加信息 */
     strncpy(report_ie.additional_info, record->additional_info,
@@ -160,11 +163,14 @@ static int send_invalid_alarm_response(const cpri_msg_header_t *req_header,
     report_ie.sub_code = (sub_code);
     report_ie.clear_flag = (ALARM_CLEAR_FLAG_CLEARED);
 
-    /* 当前时间 */
+    /* 当前时间（localtime_r：多线程下避免共享静态 struct tm） */
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    strftime(report_ie.timestamp, sizeof(report_ie.timestamp),
-             "%Y-%m-%d %H:%M:%S", tm_info);
+    struct tm tm_storage;
+    struct tm *tm_info = localtime_r(&now, &tm_storage);
+    if (tm_info) {
+        strftime(report_ie.timestamp, sizeof(report_ie.timestamp),
+                 "%Y-%m-%d %H:%M:%S", tm_info);
+    }
 
     strcpy(report_ie.additional_info, "Alarm not found or already cleared");
 

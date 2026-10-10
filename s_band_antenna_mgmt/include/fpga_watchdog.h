@@ -47,6 +47,10 @@
 #define WATCHDOG_TIMEOUT_MS         8000    /* FPGA看门狗超时时间: 8秒 */
 #define WATCHDOG_FEED_INTERVAL_MS   3000    /* 喂狗间隔: 3秒 */
 
+/* 连续喂狗失败达到该次数即上报告警。喂狗间隔 3 秒，取 3 次（约 9 秒）
+ * 略大于 FPGA 看门狗 8 秒的超时 —— 真到了这一步，复位多半已经发生或迫近。 */
+#define WATCHDOG_FEED_FAIL_ALARM_THRESHOLD  3
+
 /* GPIO配置结构体 */
 typedef struct {
     uint32_t gpio_base;         /* GPIO控制器基地址 (GPIO0_BASE/GPIO1_BASE) */
@@ -66,6 +70,7 @@ typedef struct {
     uint32_t port;                  /* GPIO端口号 */
     uint32_t use_portb;             /* 是否使用PORTB组 */
     uint32_t feed_count;            /* 喂狗计数 */
+    uint32_t consecutive_feed_fails;/* 连续喂狗失败计数 */
     bool enabled;                   /* 看门狗是否启用 */
     pthread_t thread;               /* 喂狗线程 */
     pthread_mutex_t mutex;          /* 互斥锁 */

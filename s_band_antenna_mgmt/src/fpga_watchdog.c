@@ -1,4 +1,5 @@
 #include "fpga_watchdog.h"
+#include "alarm_manager.h"
 #include "logger.h"
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -319,10 +320,29 @@ static void* watchdog_thread_func(void *arg)
 
         /* 喂狗操作 */
         if (watchdog_feed(&g_watchdog_gpio) != 0) {
-            LOG_WARN("Failed to feed watchdog");
+            /* 喂狗失败只打 WARN 是不够的：写入若静默失效（寄存器映射失效、
+             * 引脚被复用），FPGA 会在 8 秒后被硬件看门狗复位，而现场只有一条
+             * 反复出现的 WARN 可看。连续失败到阈值就上报告警。
+             * 只在首次越阈值时报一次（alarm_trigger 会去重），复位则报清除。 */
+            g_watchdog_mgr.consecutive_feed_fails++;
+            if (g_watchdog_mgr.consecutive_feed_fails == WATCHDOG_FEED_FAIL_ALARM_THRESHOLD) {
+                LOG_ERROR("Watchdog feed failed %u times consecutively — FPGA may be "
+                          "reset by its hardware watchdog; raising alarm",
+                          g_watchdog_mgr.consecutive_feed_fails);
+                alarm_trigger(ALARM_CODE_WATCHDOG_FEED_FAIL, 0,
+                              "FPGA watchdog feed failing repeatedly");
+            } else {
+                LOG_WARN("Failed to feed watchdog (consecutive=%u)",
+                         g_watchdog_mgr.consecutive_feed_fails);
+            }
         } else {
             pthread_mutex_lock(&g_watchdog_mgr.mutex);
             g_watchdog_mgr.feed_count++;
+            /* 恢复正常：若此前已因连续失败报过告警，这里报清除 */
+            if (g_watchdog_mgr.consecutive_feed_fails >= WATCHDOG_FEED_FAIL_ALARM_THRESHOLD) {
+                alarm_clear(ALARM_CODE_WATCHDOG_FEED_FAIL, 0);
+            }
+            g_watchdog_mgr.consecutive_feed_fails = 0;
             pthread_mutex_unlock(&g_watchdog_mgr.mutex);
 
            // LOG_DEBUG("Watchdog fed (count=%u)", g_watchdog_mgr.feed_count);
@@ -365,6 +385,7 @@ int fpga_watchdog_init(uint32_t gpio_base, uint32_t pin_mux_offset,
     g_watchdog_mgr.use_portb = use_portb;
     g_watchdog_mgr.enabled = false;
     g_watchdog_mgr.feed_count = 0;
+    g_watchdog_mgr.consecutive_feed_fails = 0;
 
     /* 配置GPIO参数 */
     g_watchdog_gpio.gpio_base = gpio_base;
@@ -404,6 +425,7 @@ int fpga_watchdog_start(void)
 
     g_watchdog_mgr.enabled = true;
     g_watchdog_mgr.feed_count = 0;
+    g_watchdog_mgr.consecutive_feed_fails = 0;
 
     pthread_mutex_unlock(&g_watchdog_mgr.mutex);
 

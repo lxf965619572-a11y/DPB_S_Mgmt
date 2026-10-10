@@ -144,11 +144,14 @@ int transparent_msg_parse(uint32_t msg_id, const uint8_t *payload,
     result->msg_id = msg_id;
     result->data.target_id = TRANSPARENT_TARGET_OMC;
 
-    /* 获取当前时间戳 */
+    /* 获取当前时间戳（localtime_r：多线程下避免共享静态 struct tm） */
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    strftime(result->timestamp, sizeof(result->timestamp),
-             "%Y-%m-%d %H:%M:%S", tm_info);
+    struct tm tm_storage;
+    struct tm *tm_info = localtime_r(&now, &tm_storage);
+    if (tm_info) {
+        strftime(result->timestamp, sizeof(result->timestamp),
+                 "%Y-%m-%d %H:%M:%S", tm_info);
+    }
 
     /* 至少包含一个IE头（4字节） */
     if (payload_len < sizeof(cpri_ie_header_t)) {

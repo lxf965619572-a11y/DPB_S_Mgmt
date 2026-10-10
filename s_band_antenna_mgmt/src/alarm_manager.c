@@ -325,9 +325,15 @@ int alarm_report_to_bbu(uint32_t alarm_code, uint32_t sub_code,
     ie_data.sub_code = sub_code;
     ie_data.clear_flag = clear_flag;
 
-    /* 生成时间戳 */
+    /* 生成时间戳。用 localtime_r：本进程有多个线程会取本地时间，
+     * localtime 返回的是共享的静态 struct tm，会被并发调用互相踩。 */
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
+    struct tm tm_storage;
+    struct tm *tm_info = localtime_r(&now, &tm_storage);
+    if (!tm_info) {
+        LOG_ERROR("localtime_r failed, skip alarm report timestamp");
+        return ERROR_GENERAL;
+    }
     snprintf(ie_data.timestamp, sizeof(ie_data.timestamp),
              "%04d-%02d-%02d %02d:%02d:%02d",
              tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,

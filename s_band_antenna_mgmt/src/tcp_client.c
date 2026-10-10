@@ -114,6 +114,17 @@ static int tcp_connect_to_server(tcp_client_t *client)
     /* 恢复阻塞模式 */
     fcntl(sockfd, F_SETFL, flags);
 
+    /* 设置发送超时。socket 恢复为阻塞模式后，若对端消失（拔线/掉电/中间设备
+     * 黑洞），send() 会在内核重传里阻塞数分钟；而 tcp_client_send 全程持
+     * send_mutex，tcp_client_stop 又要先取同一把锁才能 close() —— 关闭流程
+     * 会被卡住，收不到应答的线程也一直不返回。给一个有限超时把这段阻塞封顶。 */
+    struct timeval sndto;
+    sndto.tv_sec = 5;
+    sndto.tv_usec = 0;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto)) != 0) {
+        LOG_WARN("Failed to set SO_SNDTIMEO: %s", strerror(errno));
+    }
+
     pthread_mutex_lock(&client->state_mutex);
     client->sockfd = sockfd;
     client->state = TCP_STATE_CONNECTED;
@@ -252,6 +263,17 @@ int tcp_client_send(tcp_client_t *client, const uint8_t *data, uint32_t len)
     while (sent < len) {
         ssize_t ret = send(sockfd, data + sent, len - sent, 0);
         if (ret < 0) {
+            if (errno == EINTR) {
+                continue;   /* 被信号打断，重发剩余部分 */
+            }
+            /* SO_SNDTIMEO 到点后 send() 返回 EAGAIN/EWOULDBLOCK（部分实现给 EINTR）。
+             * 单独提示，便于现场把"对端不回收"与"链路真断"区分开。 */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                LOG_ERROR("Send timed out after 5s (peer not consuming, sent=%u/%u) "
+                          "- connection considered broken", sent, len);
+                pthread_mutex_unlock(&client->send_mutex);
+                return ERROR_TIMEOUT;
+            }
             LOG_ERROR("Send error: %s", strerror(errno));
             pthread_mutex_unlock(&client->send_mutex);
             return ERROR_NETWORK;

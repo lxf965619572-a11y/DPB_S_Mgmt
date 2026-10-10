@@ -319,6 +319,7 @@ static void* log_upload_thread_func(void *arg)
     bool pkg_created = false;
     struct stat st;
     time_t now;
+    struct tm tm_storage;
     struct tm *tm_info;
 
     LOG_INFO("Log upload thread started");
@@ -398,8 +399,8 @@ static void* log_upload_thread_func(void *arg)
     _Static_assert(sizeof("PAAU0000.tgz") - 1 <= 15, "remote package name too long");
 
     now = time(NULL);
-    tm_info = localtime(&now);
-    /* localtime 失败是有可能的（罕见），原来直接解引用会崩；同时把月/日夹到合法范围，
+    tm_info = localtime_r(&now, &tm_storage);
+    /* localtime_r 失败是有可能的（罕见），原来直接解引用会崩；同时把月/日夹到合法范围，
      * 编译器才能证明 %02d 不会撑破缓冲区 —— 这也是 -Wformat-truncation 一直报的原因
      * （它无法推断 tm_mon/tm_mday 的取值范围）。 */
     int mon = tm_info ? (tm_info->tm_mon + 1) : 1;

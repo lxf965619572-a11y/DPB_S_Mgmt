@@ -1076,7 +1076,12 @@ static int switch_to_version(const char *version, const char *reason)
     char rollback_dir[512];
     char timestamp[32];
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
+    struct tm tm_storage;
+    struct tm *tm_info = localtime_r(&now, &tm_storage);
+    if (!tm_info) {
+        LOG_ERROR("localtime_r failed, cannot build version timestamp");
+        return ACTIVATE_RESULT_OTHER;
+    }
 
     /* 生成时间戳 */
     strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);

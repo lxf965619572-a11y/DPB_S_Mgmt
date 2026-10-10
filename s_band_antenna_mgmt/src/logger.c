@@ -12,8 +12,10 @@ static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* 保存日志文件路径 */
 static char g_log_file_path[256] = {0};
 
-/* 写入计数器（用于运行时定期检查） */
-static size_t g_log_write_count = 0;
+/* 已写入本文件的字节数（记账）。原先只用一个"每 1000 次写入 stat 一次"的计数器，
+ * DEBUG 等级下每小时可写数万条，1000 条的间隔足以让文件超出 LOG_MAX_SIZE 数 MB。
+ * 改为按每次实际写入的字节数累加，越过阈值才去 stat —— 既精确又不增加 I/O。 */
+static size_t g_log_bytes = 0;
 
 static const char* log_level_str[] = {
     "DEBUG",
@@ -33,10 +35,13 @@ static int logger_rotate(void)
     char new_path[512];
     int i;
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
+    /* localtime_r：本函数在轮转时被调用，可能与其他线程的日志调用并发 */
+    struct tm tm_storage;
+    struct tm *tm_info = localtime_r(&now, &tm_storage);
     char time_buf[64];
 
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S",
+             tm_info ? tm_info : &(struct tm){0});
 
     /* 记录轮转开始 */
     if (g_log_file) {
@@ -98,6 +103,9 @@ static int logger_rotate(void)
             time_buf, new_path);
     fflush(g_log_file);
 
+    /* 记账归零：新文件从 0 开始。上面那条横幅的字节数也计入。 */
+    g_log_bytes = 0;
+
     return SUCCESS;
 }
 
@@ -108,19 +116,23 @@ static int logger_rotate(void)
  */
 static int logger_check_and_rotate(void)
 {
-    struct stat st;
+    /* 记账未达阈值就不必 stat。阈值取 log_max_size：越过它再去核实一次，
+     * 避免每次写入都做系统调用。g_log_bytes 在轮转后会被重置。 */
+    if (g_log_bytes < g_config.log_max_size) {
+        return SUCCESS;
+    }
 
-    /* 检查文件是否存在 */
+    struct stat st;
     if (stat(g_log_file_path, &st) != 0) {
         return SUCCESS;  // 文件不存在，无需轮转
     }
 
-    /* 检查文件大小 */
     if ((size_t)st.st_size < g_config.log_max_size) {
-        return SUCCESS;  // 未超过阈值，无需轮转
+        /* 记账与真实大小不符（如外部截断了文件）：以真实值为准修正记账 */
+        g_log_bytes = (size_t)st.st_size;
+        return SUCCESS;
     }
 
-    /* 执行轮转 */
     return logger_rotate();
 }
 
@@ -175,6 +187,15 @@ int logger_init(const char *log_file, log_level_t level)
             fprintf(stderr, "Failed to open log file: %s\n", log_file);
             return ERROR_GENERAL;
         }
+
+        /* 以启动时的文件大小为记账初值：进程重启后接着上次的大小判断轮转，
+         * 否则记账从 0 开始，已接近上限的文件还能再写一整个 LOG_MAX_SIZE。 */
+        struct stat st_init;
+        if (stat(g_log_file_path, &st_init) == 0) {
+            g_log_bytes = (size_t)st_init.st_size;
+        } else {
+            g_log_bytes = 0;
+        }
     }
 
     return SUCCESS;
@@ -187,13 +208,17 @@ void logger_log(log_level_t level, const char *file, int line, const char *fmt, 
     }
 
     time_t now;
+    struct tm tm_storage;
     struct tm *tm_info;
     char time_buf[64];
     char log_buf[1024];
 
     time(&now);
-    tm_info = localtime(&now);
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+    /* localtime_r：logger_log 会被多个线程并发调用，localtime 的返回值是
+     * 共享的静态 struct tm，并发下会互相覆盖时间戳。 */
+    tm_info = localtime_r(&now, &tm_storage);
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S",
+             tm_info ? tm_info : &(struct tm){0});
 
     va_list args;
     va_start(args, fmt);
@@ -202,12 +227,8 @@ void logger_log(log_level_t level, const char *file, int line, const char *fmt, 
 
     pthread_mutex_lock(&g_log_mutex);
 
-    /* 定期检查文件大小（每1000次写入检查一次，避免频繁stat） */
-    g_log_write_count++;
-    if (g_log_write_count >= 1000) {
-        g_log_write_count = 0;
-        logger_check_and_rotate();
-    }
+    /* 轮转检查在写入之前：记账已越过阈值时才真正 stat（见 logger_check_and_rotate） */
+    logger_check_and_rotate();
 
     /* 输出到控制台 */
     fprintf(stdout, "[%s] [%s] %s\n", time_buf, log_level_str[level], log_buf);
@@ -215,8 +236,11 @@ void logger_log(log_level_t level, const char *file, int line, const char *fmt, 
 
     /* 输出到文件 */
     if (g_log_file) {
-        fprintf(g_log_file, "[%s] [%s] [%s:%d] %s\n",
-                time_buf, log_level_str[level], file, line, log_buf);
+        int n = fprintf(g_log_file, "[%s] [%s] [%s:%d] %s\n",
+                        time_buf, log_level_str[level], file, line, log_buf);
+        if (n > 0) {
+            g_log_bytes += (size_t)n;
+        }
         fflush(g_log_file);
     }
 
