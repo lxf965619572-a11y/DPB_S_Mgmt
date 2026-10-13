@@ -17,6 +17,8 @@ S波段天线管理系统是一个用于管理和控制S波段天线阵列的嵌
 │   ├── docs/                 # 文档（procedurefile/ 为各模块说明）
 │   └── build/                # 编译输出目录（由 make 生成，不纳入版本控制）
 ├── shell_test/               # shell 模块测试脚手架
+├── tools/                    # 现场排查工具
+│   └── dump_telemetry.py     # 把遥测日志(bin)解码成可读文本；也可解上传包(.tgz)
 ├── rollback_backup/          # cell_config 改动前备份
 ├── _analysis_extract/        # 分析文档提取脚本
 ├── verify_calib.py           # 验证：校准结果查询如实回报（IE 308 -> IE 358）
@@ -177,6 +179,42 @@ make
   `--max-time` 为 600 秒，退出时不 join（否则会把退出流程卡住十分钟）。因此进程
   退出瞬间，线程若恰在 `tcp_client_send` 内部，仍可能撞上已销毁的互斥量。彻底消除
   需要可中断下载或限时 join。
+
+## 查看 FPGA 遥测日志（现场排查）
+
+FPGA 的遥测日志存在 `TELEMETRY_LOG_FILE`（默认 `logs/telemetry.bin`，路径相对
+进程工作目录，systemd 下即 `/opt/vendor/current/logs/telemetry.bin`）。
+
+> ⚠️ 这是**纯二进制帧流**，不是文本：帧内容含 `0x00`、`0x0A` 与帧尾 `0x55 0x55`。
+> **不要用 `cat` / `tail` / `grep` 或任何按行处理的工具看**，得到的是乱码。
+
+用 `tools/dump_telemetry.py` 解码成可读输出：
+
+```bash
+# 概览：帧数、按来源(A1/B1/B2)统计、异常处数
+python3 tools/dump_telemetry.py logs/telemetry.bin --summary
+
+# 逐帧转储（十六进制 + 可选 ASCII），--limit 限制帧数
+python3 tools/dump_telemetry.py logs/telemetry.bin --limit 3 --ascii
+
+# 直接看日志上传包里的遥测内容（自动挑出帧流成员）
+python3 tools/dump_telemetry.py --from-package PAAU1013.tgz --limit 1
+
+# 每帧一行纯 hex，便于与 FPGA 侧记录做逐字节 diff
+python3 tools/dump_telemetry.py logs/telemetry.bin --hex-stream > frames.txt
+```
+
+帧结构（`0xEB93`）：`帧头(2)=EB93 | 来源(1) | 长度(1) | 数据(N) | 帧尾(2)=5555`，
+共 `6+N` 字节；来源 `0xA1`→N=127（V7A）、`0xB1`/`0xB2`→N=146（V7B1/V7B2）。
+
+**判读要点**：
+- 文件为 0 字节 → 先查 UART 是否打开（`grep 'UART RS-422设备已打开' logs/antenna_mgmt.log`），
+  再查轮询是否在下发（`grep 'Telemetry poll'`）
+- 工具报"帧不完整"且只在文件末尾 → 读取时正在写入，属正常，稍后重读
+- 工具报成片"非帧头字节 / 帧尾错误" → 串口有噪声，或波特率/校验位不符
+- **遥测帧里没有校验和**，只有帧头/来源白名单/长度/帧尾四项结构校验。所以
+  "能切出帧"只证明帧边界正确，**不能证明数据内容与 FPGA 发出的完全一致**。
+  要逐字节确认，须两边各自记录后 `diff`（见 `--hex-stream`）。
 
 ## 技术文档
 
