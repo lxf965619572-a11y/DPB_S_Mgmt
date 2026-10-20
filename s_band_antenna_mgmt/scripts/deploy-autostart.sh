@@ -64,6 +64,8 @@ REQUIRED_FILES=(
     "$SCRIPT_DIR/antenna-mgmt.service"
     "$SCRIPT_DIR/antenna-mgmt-launcher.sh"
     "$SCRIPT_DIR/restart-after-activate.sh"
+    "$SCRIPT_DIR/setup-network.sh"
+    "$SCRIPT_DIR/antenna-mgmt-network.service"
 )
 
 for file in "${REQUIRED_FILES[@]}"; do
@@ -236,6 +238,19 @@ cp "$SCRIPT_DIR/antenna-mgmt-launcher.sh" /opt/vendor/scripts/
 cp "$SCRIPT_DIR/restart-after-activate.sh" /opt/vendor/scripts/
 chmod +x /opt/vendor/scripts/*.sh
 print_success "启动脚本已安装"
+
+# 安装开机网络配置服务：等待 FPGA PHY 就绪后再拉起 eth1，
+# 避免 FPGA 加载慢时网卡配置一次失败就再也不重试。
+cp "$SCRIPT_DIR/setup-network.sh" /opt/vendor/scripts/
+chmod +x /opt/vendor/scripts/setup-network.sh
+cp "$SCRIPT_DIR/antenna-mgmt-network.service" /etc/systemd/system/
+# SELinux Enforcing 的系统上，确保 systemd 能执行脚本、识别 unit 文件
+if command -v restorecon >/dev/null 2>&1; then
+    restorecon -R /opt/vendor/scripts 2>/dev/null || true
+    restorecon /etc/systemd/system/antenna-mgmt-network.service 2>/dev/null || true
+fi
+systemctl enable antenna-mgmt-network.service
+print_success "网络配置服务已安装并启用"
 
 # 步骤6: 重新加载systemd并启用服务
 print_step "配置systemd服务..."

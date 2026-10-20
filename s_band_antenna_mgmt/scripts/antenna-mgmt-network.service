@@ -1,16 +1,24 @@
 [Unit]
 Description=S-Band Antenna Management Network Configuration
 Documentation=file:///opt/vendor/docs/README.md
+# 去掉 DefaultDependencies=no：让服务至少排在 udevd/basic.target 之后，
+# 避免在驱动 probe、udev 冷插拔还没完成时就做一次性配置。
+# 排在常见网络管理器之后，确保 detect_network_manager 能检测到正确的管理器
+# （不存在的单元会被 systemd 忽略，不会报错）
+After=network-pre.target systemd-udevd.service systemd-networkd.service NetworkManager.service
 Before=network-online.target
 Wants=network.target
-After=network-pre.target
-DefaultDependencies=no
+# FPGA 加载时间有抖动，失败后持续重试，不做启动频率限制
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/vendor/scripts/setup-network.sh auto
-TimeoutStartSec=60
+# 脚本内部最多等待 ETH1_WAIT_TIMEOUT（默认 120s），这里再留出余量
+TimeoutStartSec=180
+Restart=on-failure
+RestartSec=10
 
 # 确保在网络配置之前运行
 StandardOutput=journal

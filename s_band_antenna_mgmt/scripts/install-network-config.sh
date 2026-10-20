@@ -40,6 +40,12 @@ log_info "Installed: /opt/vendor/scripts/setup-network.sh"
 cp "$SCRIPT_DIR/antenna-mgmt-network.service" /etc/systemd/system/
 log_info "Installed: /etc/systemd/system/antenna-mgmt-network.service"
 
+# SELinux Enforcing 的系统上，确保 systemd 能执行脚本、识别 unit 文件
+if command -v restorecon >/dev/null 2>&1; then
+    restorecon -R /opt/vendor/scripts 2>/dev/null || true
+    restorecon /etc/systemd/system/antenna-mgmt-network.service 2>/dev/null || true
+fi
+
 # 重新加载systemd
 systemctl daemon-reload
 
