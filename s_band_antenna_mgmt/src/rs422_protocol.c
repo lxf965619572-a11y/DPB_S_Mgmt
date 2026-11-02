@@ -171,6 +171,14 @@ int rs422_decode_frame(const uint8_t *frame_buf, uint32_t frame_len,
 
     /* 验证帧长度 (data_len是实际长度-1,所以要+1) */
     uint32_t actual_data_len = data_len + 1;
+
+    /* 数据域至少要容纳 2 字节命令码。data_len=0 时 actual_data_len=1，
+     * 下面读命令码会读进校验和字节，且 pl_len = actual_data_len - 2 回绕成
+     * 0xFFFFFFFF，调用方基于 payload_len 的长度检查随之全部失效。 */
+    if (actual_data_len < 2) {
+        LOG_ERROR("数据域过短: %u 字节（至少需要 2 字节命令码）", actual_data_len);
+        return ERROR_GENERAL;
+    }
     if (frame_len < RS422_HEADER_SIZE + actual_data_len + RS422_CRC_SIZE) {
         LOG_ERROR("帧长度不匹配: 实际 %u, 期望 %u",
                   frame_len, RS422_HEADER_SIZE + actual_data_len + RS422_CRC_SIZE);

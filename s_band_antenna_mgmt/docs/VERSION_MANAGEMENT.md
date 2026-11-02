@@ -29,7 +29,7 @@ bin_file=antenna_mgmt
 
 **激活流程**：
 1. BBU发送版本下载请求（IE 14，ver_type=0）
-2. PAAU通过FTP下载软件包到`/opt/vendor/downloads/`
+2. PAAU通过FTP下载软件包到`/opt/vendor/downloads/software/`
 3. 解压到`/opt/vendor/versions/{version}/`
 4. 验证antenna_mgmt文件的SHA256校验和
 5. BBU发送版本激活指示（IE 311，ver_type=0）
@@ -40,6 +40,25 @@ bin_file=antenna_mgmt
 **重启方式**：
 - 推荐：`systemctl restart antenna-mgmt.service`（服务重启）
 - 备选：`shutdown -r now`（系统重启，谨慎使用）
+
+**试运行与自动回退**：
+
+BBU 激活新软件版本后，新版本先进入"试运行"，失败时自动切回上一个版本：
+
+1. 激活时，程序先写试运行记录`/opt/vendor/versions/.rollback/trial`（新版本、上一个版本、启动次数），再原子地切换`/opt/vendor/current`。
+2. systemd 每次启动服务前执行`/opt/vendor/scripts/upgrade-guard.sh`（`ExecStartPre`），启动次数 +1。
+3. 新版本与 BBU **完成通道建立** → 确认健康，删除试运行记录。
+4. 新版本连续运行满`UPGRADE_TRIAL_STABLE_SEC`秒（默认 120）→ 启动次数清零，此后断电/正常重启不计为失败，记录保留到 BBU 确认。
+5. 连续启动`UPGRADE_TRIAL_MAX_STARTS`次（默认 3）仍未确认 → `upgrade-guard.sh`把`current`切回上一个版本，写回退通知`auto_rollback.last`。新版本一启动就崩时，约 30~40 秒回到旧版本。
+6. 旧版本启动后读到回退通知，产生"版本激活失败"告警（1158，附加信息`auto rollback V2.0 -> V1.0`），TCP 建链时上报 BBU；通道建立后删除通知文件。
+
+查看试运行/回退日志：`journalctl -u antenna-mgmt.service | grep upgrade-guard`。
+
+限制：
+- 只覆盖"起不来/启动后很快崩溃"。运行超过`UPGRADE_TRIAL_STABLE_SEC`后才崩溃、或进程不崩但卡死的情况不会触发回退。
+- 首次安装（没有上一个版本）不进入试运行。
+- 自动回退依赖`upgrade-guard.sh`与 service 中的`ExecStartPre`，它们不在软件版本包内，需通过`deploy-autostart.sh`安装一次。
+- 回退到的旧版本若早于本功能，不会产生 1158 告警（但回退本身由脚本完成，不受影响）。
 
 ---
 
@@ -64,15 +83,44 @@ version=V1.0.0.20260401
 bin_file=fpga_firmware.bin
 ```
 
+**FPGA 种类（由 metadata.txt 的 `file_sub_type` 区分）**：
+
+| file_sub_type | FPGA 种类 | 存储目录 |
+|---|---|---|
+| 0x01 / 0x02 | V7A | `/opt/vendor/firmware/v7a/{version}/` |
+| 0x13 / 0x14 | V7B | `/opt/vendor/firmware/v7b/{version}/` |
+| 0x11 / 0x12 | 子阵 | `/opt/vendor/firmware/subarray/{version}/` |
+
+其他子类型的固件包在下载阶段即被拒收（结果指示返回"其他失败"）。
+
+**存储布局（软件与固件分开、不同 FPGA 分开）**：
+```
+/opt/vendor/
+├── versions/{version}/              # 软件版本（/opt/vendor/current 指向这里）
+├── firmware/
+│   ├── v7a/{version}/               # V7A 固件
+│   ├── v7b/{version}/               # V7B 固件
+│   ├── subarray/{version}/          # 子阵固件
+│   └── .staging/                    # 解压暂存区（判定种类前）
+└── downloads/
+    ├── software/                    # 软件包下载暂存
+    └── firmware/                    # 固件包下载暂存
+```
+不同 FPGA 的固件即使版本号相同也互不覆盖；只有同一种 FPGA 的同版本包会被新包替换。
+
 **激活流程**：
 1. BBU发送版本下载请求（IE 14，ver_type=1）
-2. PAAU通过FTP下载固件包到`/opt/vendor/downloads/`
-3. 解压到`/opt/vendor/versions/{version}/`
-4. 验证fpga_firmware.bin文件的SHA256校验和
+2. PAAU通过FTP下载固件包到`/opt/vendor/downloads/firmware/`
+3. 解压到暂存区`/opt/vendor/firmware/.staging/`，验证fpga_firmware.bin的SHA256校验和
+4. 读取metadata.txt，按`file_sub_type`判定FPGA种类，以`version`为版本号移入`/opt/vendor/firmware/{种类}/{version}/`
 5. BBU发送版本激活指示（IE 311，ver_type=1）
-6. PAAU更新符号链接（记录当前固件版本）
+6. PAAU在v7a/v7b/subarray三个目录中查找该版本（大小写不敏感），并核对包内`file_sub_type`与所在目录一致
 7. **通过RS-422串口上注固件到FPGA**
 8. 上注完成后发送结果指示给BBU
+
+**注意**：
+- IE 311 只带版本号、不带FPGA种类。若多种FPGA存在同一版本号，取最近入库的那个并在日志中告警，因此**建议不同FPGA的固件使用不同的版本号**（如带上 V7A/V7B/SUB 前缀）。
+- 激活固件时不会到`/opt/vendor/versions/`下查找（软件包也带`file_sub_type`，避免误把软件当固件上注）。旧版本程序存放在`versions/`下的固件，升级后需重新下载一次。
 
 **上注方式**：
 - 通过`/dev/ttyAMA2`（RS-422串口）

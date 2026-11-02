@@ -11,6 +11,7 @@
 3. **antenna-mgmt.service** - systemd服务文件
 4. **antenna-mgmt-launcher.sh** - 服务启动脚本
 5. **restart-after-activate.sh** - 激活后重启脚本
+6. **upgrade-guard.sh** - 升级试运行保护（service 的 ExecStartPre，新版本连续起不来时自动切回上一个版本，详见 docs/VERSION_MANAGEMENT.md）
 
 ## 使用流程
 

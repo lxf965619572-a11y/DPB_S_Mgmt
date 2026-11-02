@@ -88,6 +88,7 @@ typedef struct {
     int8_t over_temp_threshold_high;    /* 过温门限(°C) */
     int8_t over_temp_threshold_low;     /* 低温门限(°C) */
     uint32_t link_grace_sec;            /* 光链路告警启动宽限期(秒), 0=关闭 */
+    uint8_t optical_port_count;         /* 1097 监测的光口数: 4=仅主光口0-3, 8=主+备0-7; 其他值按4处理 */
 } alarm_config_t;
 
 /**

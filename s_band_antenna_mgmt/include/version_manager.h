@@ -42,7 +42,30 @@
 #define VERSION_CURRENT_LINK        "/opt/vendor/current"
 #define VERSION_ROLLBACK_DIR        "/opt/vendor/versions/.rollback"
 #define VERSION_DOWNLOAD_DIR        "/opt/vendor/downloads"
+
+/* 软件与固件分开存放：
+ *   软件: VERSION_BASE_DIR/<版本>                      （/opt/vendor/current 指向这里）
+ *   固件: FIRMWARE_BASE_DIR/<v7a|v7b|subarray>/<版本>  （按 FPGA 种类分目录）
+ * 原先固件也解压到 VERSION_BASE_DIR/<版本>，与软件、以及不同 FPGA 的固件共用一个
+ * 命名空间，版本号相同就会互相覆盖（下载时会先 rm -rf 同名目录）。 */
+#define FIRMWARE_BASE_DIR           "/opt/vendor/firmware"
+#define FIRMWARE_STAGING_DIR        "/opt/vendor/firmware/.staging"   /* 解压后、判定 FPGA 种类前的暂存区 */
+#define VERSION_DOWNLOAD_SW_DIR     VERSION_DOWNLOAD_DIR "/software"
+#define VERSION_DOWNLOAD_FW_DIR     VERSION_DOWNLOAD_DIR "/firmware"
 #define VERSION_LOG_FILE            "/var/log/vendor_version.log"
+
+/* ==================== 软件升级试运行与自动回退 ====================
+ * BBU 激活新软件版本时，先写试运行记录（新版本、上一个版本、启动次数），再切换
+ * /opt/vendor/current。之后：
+ *   - systemd 每次启动服务前执行 scripts/upgrade-guard.sh（ExecStartPre），
+ *     启动次数 +1；超过 UPGRADE_TRIAL_MAX_STARTS 次仍未被确认，就把 current
+ *     切回上一个版本，并写回退通知文件；
+ *   - 新版本与 BBU 完成通道建立 → 确认健康，删除试运行记录；
+ *   - 新版本连续运行 UPGRADE_TRIAL_STABLE_SEC 秒 → 启动次数清零（说明进程能
+ *     稳定运行，此后的重启视为正常重启/断电，不计入失败），记录保留到 BBU 确认。
+ * 文件格式均为 key=value 文本，C 与 shell 两侧都要能解析，改格式须同步改脚本。 */
+#define VERSION_TRIAL_FILE          VERSION_ROLLBACK_DIR "/trial"
+#define VERSION_AUTO_ROLLBACK_NOTICE VERSION_ROLLBACK_DIR "/auto_rollback.last"
 
 /* 最大版本号长度 */
 #define MAX_VERSION_LEN             40
@@ -133,8 +156,16 @@ int version_get_current(char *version, size_t len);
 /* 列出所有已安装版本 */
 int version_list_installed(char versions[][MAX_VERSION_LEN], int max_count);
 
-/* 回滚到指定版本 */
+/* 回滚到指定版本（人工回退：直接切换，不进入试运行） */
 int version_rollback(const char *version, const char *reason);
+
+/* 与 BBU 完成通道建立时调用：确认当前软件版本健康，结束试运行；
+ * 若本次启动前发生过自动回退，通知已随告警上报，一并清掉通知文件。 */
+void version_trial_on_channel_established(void);
+
+/* 主循环每秒调用一次，传入进程已运行秒数：达到 UPGRADE_TRIAL_STABLE_SEC
+ * 时把试运行的启动计数清零。 */
+void version_trial_on_uptime(uint32_t uptime_sec);
 
 /* 版本管理器销毁 */
 void version_manager_destroy(void);

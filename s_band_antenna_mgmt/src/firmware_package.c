@@ -1,5 +1,6 @@
 #include "firmware_package.h"
 #include "logger.h"
+#include "shell_util.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,45 @@ int firmware_package_init(void)
 void firmware_package_cleanup(void)
 {
     LOG_INFO("固件包解析模块已清理");
+}
+
+/* FPGA 种类映射：只认下面这几个子类型，其余一律视为未知并拒绝入库，
+ * 避免把来路不明的包放进某个 FPGA 的目录、后续被当成该 FPGA 的固件上注。 */
+fpga_kind_t firmware_fpga_kind(uint8_t file_sub_type)
+{
+    switch (file_sub_type) {
+        case 0x01:
+        case 0x02:
+            return FPGA_KIND_V7A;
+        case 0x13:
+        case 0x14:
+            return FPGA_KIND_V7B;
+        case 0x11:
+        case 0x12:
+            return FPGA_KIND_SUBARRAY;
+        default:
+            return FPGA_KIND_UNKNOWN;
+    }
+}
+
+const char *firmware_fpga_kind_dir(fpga_kind_t kind)
+{
+    switch (kind) {
+        case FPGA_KIND_V7A:      return "v7a";
+        case FPGA_KIND_V7B:      return "v7b";
+        case FPGA_KIND_SUBARRAY: return "subarray";
+        default:                 return NULL;
+    }
+}
+
+const char *firmware_fpga_kind_name(fpga_kind_t kind)
+{
+    switch (kind) {
+        case FPGA_KIND_V7A:      return "V7A";
+        case FPGA_KIND_V7B:      return "V7B";
+        case FPGA_KIND_SUBARRAY: return "子阵";
+        default:                 return "未知";
+    }
 }
 
 /* 辅助函数: 去除字符串首尾空白 */
@@ -99,6 +139,13 @@ int firmware_parse_metadata(const char *version_dir, firmware_metadata_t *metada
     /* 检查必需字段 */
     if (fields_found < 5) {
         LOG_ERROR("元数据缺少必需字段 (找到 %d/5 个字段)", fields_found);
+        return ERROR_GENERAL;
+    }
+
+    /* bin_file 来自包内 metadata.txt，只允许是版本目录下的普通文件名：
+     * 含 '/'、".." 或控制字符的值会让拼出来的路径指向版本目录之外。 */
+    if (!shell_safe_name(bin_filename)) {
+        LOG_ERROR("元数据 bin_file 非法（只允许 [A-Za-z0-9._-] 的文件名）: '%s'", bin_filename);
         return ERROR_GENERAL;
     }
 

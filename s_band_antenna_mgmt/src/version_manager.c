@@ -3,6 +3,8 @@
 #include "tcp_client.h"
 #include "config.h"
 #include "fpga_firmware_injector.h"
+#include "firmware_package.h"
+#include "alarm_manager.h"
 #include "shell_util.h"
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -504,61 +506,11 @@ static int verify_bin_file_checksum(const char *version_dir)
 }
 
 
-/* 查找版本目录（支持大小写不敏感匹配）
- * 返回实际的版本目录路径，如果找不到返回 NULL
- */
-static char* find_version_directory(const char *version, char *actual_path, size_t path_size)
+/* 保存版本元数据（写到 dir/version.json；软件与固件的目录不同，由调用方给出） */
+static int save_version_metadata(const char *dir, const version_metadata_t *metadata)
 {
-    char version_dir[512];
-    struct stat st;
-
-    /* 首先尝试精确匹配 */
-    snprintf(version_dir, sizeof(version_dir), "%s/%s", VERSION_BASE_DIR, version);
-    if (stat(version_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
-        strncpy(actual_path, version_dir, path_size - 1);
-        actual_path[path_size - 1] = '\0';
-        return actual_path;
-    }
-
-    /* 精确匹配失败，尝试大小写不敏感匹配 */
-    DIR *dir = opendir(VERSION_BASE_DIR);
-    if (!dir) {
-        LOG_ERROR("Failed to open version base directory: %s", VERSION_BASE_DIR);
-        return NULL;
-    }
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        /* 跳过 . 和 .. */
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-
-        /* 大小写不敏感比较 */
-        if (strcasecmp(entry->d_name, version) == 0) {
-            snprintf(version_dir, sizeof(version_dir), "%s/%s", VERSION_BASE_DIR, entry->d_name);
-
-            /* 验证是否为目录 */
-            if (stat(version_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
-                strncpy(actual_path, version_dir, path_size - 1);
-                actual_path[path_size - 1] = '\0';
-                closedir(dir);
-                LOG_INFO("Found version directory (case-insensitive): %s -> %s", version, entry->d_name);
-                return actual_path;
-            }
-        }
-    }
-
-    closedir(dir);
-    return NULL;
-}
-
-/* 保存版本元数据 */
-static int save_version_metadata(const version_metadata_t *metadata)
-{
-    char meta_path[512];
-    snprintf(meta_path, sizeof(meta_path), "%s/%s/version.json",
-            VERSION_BASE_DIR, metadata->version);
+    char meta_path[512 + 32];   /* dir 最长 512，再拼文件名 */
+    snprintf(meta_path, sizeof(meta_path), "%s/version.json", dir);
 
     FILE *fp = fopen(meta_path, "w");
     if (!fp) {
@@ -580,20 +532,21 @@ static int save_version_metadata(const version_metadata_t *metadata)
     return SUCCESS;
 }
 
-/* 加载版本元数据 */
-static int load_version_metadata(const char *version, version_metadata_t *metadata)
+/* 加载版本元数据（读 dir/metadata.txt，没有则读 dir/version.json）。
+ * 目录名的最后一段作为缺省版本号。 */
+static int load_version_metadata(const char *dir, version_metadata_t *metadata)
 {
-    char meta_path[512];
+    char meta_path[512 + 32];   /* dir 最长 512，再拼文件名 */
+    const char *version = strrchr(dir, '/');
+    version = version ? version + 1 : dir;
 
     /* 优先尝试读取metadata.txt（新格式） */
-    snprintf(meta_path, sizeof(meta_path), "%s/%s/metadata.txt",
-            VERSION_BASE_DIR, version);
+    snprintf(meta_path, sizeof(meta_path), "%s/metadata.txt", dir);
 
     FILE *fp = fopen(meta_path, "r");
     if (!fp) {
         /* 如果metadata.txt不存在，尝试version.json（旧格式） */
-        snprintf(meta_path, sizeof(meta_path), "%s/%s/version.json",
-                VERSION_BASE_DIR, version);
+        snprintf(meta_path, sizeof(meta_path), "%s/version.json", dir);
         fp = fopen(meta_path, "r");
         if (!fp) {
             LOG_ERROR("Failed to open metadata file (tried metadata.txt and version.json)");
@@ -683,6 +636,106 @@ static int load_version_metadata(const char *version, version_metadata_t *metada
     LOG_INFO("Loaded metadata: version=%s, checksum=%s",
              metadata->version, metadata->checksum);
 
+    return SUCCESS;
+}
+
+/* 删除目录树（argv 传参，不经过 shell；路径中可能含北向/包内可控的版本号） */
+static void remove_tree(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        return;     /* 不存在，无需删除 */
+    }
+    char *rm_argv[] = { (char *)"rm", (char *)"-rf", (char *)path, NULL };
+    char rm_out[256] = {0};
+    int rm_ret = shell_run(rm_argv, rm_out, sizeof(rm_out));
+    if (rm_ret != 0) {
+        LOG_WARN("Failed to remove %s (ret=%d, out=%s)", path, rm_ret, rm_out);
+    }
+}
+
+/* 在 FIRMWARE_BASE_DIR/<种类>/ 下按版本号查找固件目录（先精确、后大小写不敏感）。
+ *
+ * IE 311（激活指示）只带版本号、不带 FPGA 种类，所以要在三个种类目录里都找：
+ *   - 只命中一个：就是它；
+ *   - 命中多个（不同 FPGA 的固件用了同一个版本号）：取最近入库的那个（目录
+ *     mtime 最新），即 BBU 刚下载的那个，并打 WARN 列出全部候选。
+ *     建议不同 FPGA 的固件版本号不要重复，从根本上消除歧义。
+ *
+ * 注意：刻意不回退到 VERSION_BASE_DIR（旧布局/软件目录）。软件包的 metadata.txt
+ * 同样带 file_sub_type（例如 0x01），若回退去那里找，同名的软件版本可能被当成
+ * V7A 固件写进 FPGA。旧布局下的固件需要重新下载一次。
+ *
+ * 成功返回 SUCCESS，并输出目录路径与 FPGA 种类。 */
+static int find_firmware_directory(const char *version, char *out_dir, size_t out_size,
+                                   fpga_kind_t *out_kind)
+{
+    char best_dir[512] = {0};
+    fpga_kind_t best_kind = FPGA_KIND_UNKNOWN;
+    time_t best_mtime = 0;
+    int matches = 0;
+
+    for (int k = FPGA_KIND_UNKNOWN + 1; k < FPGA_KIND_COUNT; k++) {
+        const char *kind_dir = firmware_fpga_kind_dir((fpga_kind_t)k);
+        char base[256];
+        snprintf(base, sizeof(base), "%s/%s", FIRMWARE_BASE_DIR, kind_dir);
+
+        char found[512] = {0};
+        struct stat st;
+
+        /* 精确匹配 */
+        char candidate[512];
+        snprintf(candidate, sizeof(candidate), "%s/%s", base, version);
+        if (stat(candidate, &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(found, sizeof(found), "%s", candidate);
+        } else {
+            /* 大小写不敏感匹配（兼容 BBU 下发的版本号大小写与包内不一致） */
+            DIR *dir = opendir(base);
+            if (dir) {
+                struct dirent *entry;
+                while ((entry = readdir(dir)) != NULL) {
+                    if (entry->d_name[0] == '.') {
+                        continue;
+                    }
+                    if (strcasecmp(entry->d_name, version) == 0) {
+                        snprintf(candidate, sizeof(candidate), "%s/%s", base, entry->d_name);
+                        if (stat(candidate, &st) == 0 && S_ISDIR(st.st_mode)) {
+                            snprintf(found, sizeof(found), "%s", candidate);
+                            break;
+                        }
+                    }
+                }
+                closedir(dir);
+            }
+        }
+
+        if (found[0] == '\0') {
+            continue;
+        }
+
+        matches++;
+        LOG_INFO("Firmware candidate for version %s: %s (%s)",
+                 version, found, firmware_fpga_kind_name((fpga_kind_t)k));
+        if (matches == 1 || st.st_mtime > best_mtime) {
+            snprintf(best_dir, sizeof(best_dir), "%s", found);
+            best_kind = (fpga_kind_t)k;
+            best_mtime = st.st_mtime;
+        }
+    }
+
+    if (matches == 0) {
+        return ERROR_GENERAL;
+    }
+    if (matches > 1) {
+        LOG_WARN("Firmware version %s exists for %d FPGA kinds, picking the most recently "
+                 "installed one: %s (%s). Use distinct version numbers per FPGA to avoid this.",
+                 version, matches, best_dir, firmware_fpga_kind_name(best_kind));
+    }
+
+    snprintf(out_dir, out_size, "%s", best_dir);
+    if (out_kind) {
+        *out_kind = best_kind;
+    }
     return SUCCESS;
 }
 
@@ -842,16 +895,19 @@ static void* version_download_thread_func(void *arg)
 
     LOG_INFO("Version download thread started for version: %s", task->version);
 
-    /* 创建下载目录 */
-    if (create_directory_recursive(VERSION_DOWNLOAD_DIR) != SUCCESS) {
-        LOG_ERROR("Failed to create download directory");
+    const bool is_firmware = (task->ver_type == VERSION_TYPE_FIRMWARE);
+
+    /* 创建下载目录：软件与固件的压缩包分开暂存，同名文件互不覆盖 */
+    const char *download_dir = is_firmware ? VERSION_DOWNLOAD_FW_DIR : VERSION_DOWNLOAD_SW_DIR;
+    if (create_directory_recursive(download_dir) != SUCCESS) {
+        LOG_ERROR("Failed to create download directory: %s", download_dir);
         result = DOWNLOAD_RESULT_OTHER;
         goto send_result;
     }
 
     /* 下载文件路径 */
     snprintf(download_path, sizeof(download_path), "%s/%s",
-            VERSION_DOWNLOAD_DIR, task->file_name);
+            download_dir, task->file_name);
 
     /* 执行FTP下载（3次重试） */
     int ret = ftp_download_file_with_curl(task->ftp_server,
@@ -888,109 +944,144 @@ static void* version_download_thread_func(void *arg)
     }
     LOG_INFO("File checksum: %s", checksum);
 
-    /* 创建版本目录 */
-    snprintf(version_dir, sizeof(version_dir), "%s/%s",
-            VERSION_BASE_DIR, task->version);
-    if (create_directory_recursive(version_dir) != SUCCESS) {
-        LOG_ERROR("Failed to create version directory: %s", version_dir);
-        result = DOWNLOAD_RESULT_OTHER;
-        goto send_result;
-    }
-
-    /* 解压tar文件 */
-    LOG_INFO("Extracting tar file to: %s", version_dir);
-    if (extract_tar_file(download_path, version_dir) != SUCCESS) {
-        LOG_ERROR("Failed to extract tar file");
-        result = DOWNLOAD_RESULT_EXTRACT;
-        goto send_result;
-    }
-
-    /* 【关键】验证文件的校验和 */
-    LOG_INFO("Verifying file checksum (ver_type=%u)...", task->ver_type);
-    result = verify_bin_file_checksum(version_dir);
-    if (result != DOWNLOAD_RESULT_SUCCESS) {
-        LOG_ERROR("File checksum verification FAILED");
-        /* 删除已解压的文件（安全措施） */
-        /* argv 数组传参，不经过 shell（version_dir 含北向可控的版本号字段） */
-        char *cleanup_argv[] = { (char *)"rm", (char *)"-rf", (char *)version_dir, NULL };
-        char cleanup_out[256] = {0};
-        int cleanup_ret = shell_run(cleanup_argv, cleanup_out, sizeof(cleanup_out));
-        if (cleanup_ret != 0) {
-            LOG_WARN("Failed to cleanup corrupted directory: %s (ret=%d, out=%s)",
-                     version_dir, cleanup_ret, cleanup_out);
-        }
-        LOG_WARN("Removed corrupted version directory: %s", version_dir);
-        goto send_result;
-    }
-
-    /* 从 metadata.txt 读取真实版本号（仅固件版本） */
     version_metadata_t metadata;
     memset(&metadata, 0, sizeof(metadata));
 
-    if (task->ver_type == VERSION_TYPE_FIRMWARE) {
-        /* 固件版本：从 metadata.txt 读取版本号 */
-        if (load_version_metadata(task->version, &metadata) == SUCCESS && metadata.version[0] != '\0') {
-            /* 【关键】metadata.version 来自压缩包内解出的 metadata.txt/version.json
-             * （见 load_version_metadata 的 %39[^"] 与 key=value 两条解析路径，两者都
-             * 原样接受 '/' 和 '.'）。它随后被拼进 new_version_dir，交给 rm -rf 并用于
-             * rename —— 这是二阶注入面：压缩包本身来自北向指定的下载路径，
-             * 在此处若不过滤，一个 version=../../../etc 的包就能命令 rm -rf 打到
-             * /opt/vendor/versions/ 之外。此处与入站处同样过 shell_safe_name，
-             * 不通过就保留临时版本号（目录名仍是受校验的 task->version）。 */
-            if (!shell_safe_name(metadata.version)) {
-                LOG_ERROR("SECURITY ALERT: unsafe version in package metadata, "
-                          "rejected: '%s' (keeping temp version '%s')",
-                          metadata.version, task->version);
-                strncpy(metadata.version, task->version, sizeof(metadata.version) - 1);
-                metadata.version[sizeof(metadata.version) - 1] = '\0';
-            }
-
-            /* 如果从 metadata.txt 读取的版本号与临时版本号不同，需要重命名目录 */
-            if (strcmp(metadata.version, task->version) != 0) {
-                char new_version_dir[512];
-                snprintf(new_version_dir, sizeof(new_version_dir), "%s/%s",
-                        VERSION_BASE_DIR, metadata.version);
-
-                LOG_INFO("Real firmware version from metadata.txt: %s (temp version was: %s)",
-                        metadata.version, task->version);
-
-                /* 检查目标目录是否已存在 */
-                struct stat st_check;
-                if (stat(new_version_dir, &st_check) == 0) {
-                    LOG_WARN("Version directory already exists: %s, removing old version", new_version_dir);
-                    /* argv 数组传参，不经过 shell。
-                     * 注意 new_version_dir 的名字来自解压出来的 metadata.txt，
-                     * 属于二阶注入面（tarball 本身来自北向指定的下载路径）。 */
-                    char *rm_argv[] = { (char *)"rm", (char *)"-rf", (char *)new_version_dir, NULL };
-                    char rm_out[256] = {0};
-                    int rm_ret = shell_run(rm_argv, rm_out, sizeof(rm_out));
-                    if (rm_ret != 0) {
-                        LOG_WARN("Failed to remove existing version dir %s (ret=%d, out=%s)",
-                                 new_version_dir, rm_ret, rm_out);
-                    }
-                }
-
-                /* 重命名目录 */
-                if (rename(version_dir, new_version_dir) != 0) {
-                    LOG_ERROR("Failed to rename version directory from %s to %s: %s",
-                             version_dir, new_version_dir, strerror(errno));
-                    result = DOWNLOAD_RESULT_OTHER;
-                    goto send_result;
-                }
-
-                /* 更新版本目录路径和任务中的版本号 */
-                strncpy(version_dir, new_version_dir, sizeof(version_dir) - 1);
-                strncpy(task->version, metadata.version, sizeof(task->version) - 1);
-                LOG_INFO("Firmware version directory renamed to: %s", version_dir);
-            }
-        } else {
-            LOG_WARN("Failed to load metadata.txt for firmware, using temporary version: %s", task->version);
-            strncpy(metadata.version, task->version, sizeof(metadata.version) - 1);
+    if (!is_firmware) {
+        /* ================= 软件版本：VERSION_BASE_DIR/<版本>（布局不变） ================= */
+        snprintf(version_dir, sizeof(version_dir), "%s/%s",
+                VERSION_BASE_DIR, task->version);
+        if (create_directory_recursive(version_dir) != SUCCESS) {
+            LOG_ERROR("Failed to create version directory: %s", version_dir);
+            result = DOWNLOAD_RESULT_OTHER;
+            goto send_result;
         }
-    } else {
+
+        LOG_INFO("Extracting software package to: %s", version_dir);
+        if (extract_tar_file(download_path, version_dir) != SUCCESS) {
+            LOG_ERROR("Failed to extract tar file");
+            result = DOWNLOAD_RESULT_EXTRACT;
+            goto send_result;
+        }
+
+        /* 【关键】验证文件的校验和 */
+        LOG_INFO("Verifying file checksum (ver_type=%u)...", task->ver_type);
+        result = verify_bin_file_checksum(version_dir);
+        if (result != DOWNLOAD_RESULT_SUCCESS) {
+            LOG_ERROR("File checksum verification FAILED");
+            remove_tree(version_dir);     /* 删除已解压的文件（安全措施） */
+            LOG_WARN("Removed corrupted version directory: %s", version_dir);
+            goto send_result;
+        }
+
         /* 软件版本：使用文件名或 file_ver 作为版本号，不从 metadata.txt 读取 */
         LOG_INFO("Software version: using version from filename: %s", task->version);
         strncpy(metadata.version, task->version, sizeof(metadata.version) - 1);
+    } else {
+        /* ======== 固件版本：FIRMWARE_BASE_DIR/<v7a|v7b|subarray>/<版本> ========
+         * FPGA 种类要解开包、读 metadata.txt 的 file_sub_type 才知道，所以先解压到
+         * 暂存区，校验通过并判定种类后，再整体 rename 到对应种类的目录。
+         * 暂存区与目标目录都在 FIRMWARE_BASE_DIR 下，rename 不跨文件系统。 */
+        char staging_dir[512];
+        snprintf(staging_dir, sizeof(staging_dir), "%s/%s",
+                 FIRMWARE_STAGING_DIR, task->version);
+        remove_tree(staging_dir);     /* 清掉上次异常中断留下的残留 */
+        if (create_directory_recursive(staging_dir) != SUCCESS) {
+            LOG_ERROR("Failed to create firmware staging directory: %s", staging_dir);
+            result = DOWNLOAD_RESULT_OTHER;
+            goto send_result;
+        }
+
+        LOG_INFO("Extracting firmware package to staging: %s", staging_dir);
+        if (extract_tar_file(download_path, staging_dir) != SUCCESS) {
+            LOG_ERROR("Failed to extract tar file");
+            remove_tree(staging_dir);
+            result = DOWNLOAD_RESULT_EXTRACT;
+            goto send_result;
+        }
+
+        /* 【关键】验证文件的校验和 */
+        LOG_INFO("Verifying file checksum (ver_type=%u)...", task->ver_type);
+        result = verify_bin_file_checksum(staging_dir);
+        if (result != DOWNLOAD_RESULT_SUCCESS) {
+            LOG_ERROR("File checksum verification FAILED");
+            remove_tree(staging_dir);
+            LOG_WARN("Removed corrupted firmware staging directory: %s", staging_dir);
+            goto send_result;
+        }
+
+        /* 读 metadata.txt：file_sub_type 决定 FPGA 种类，version 是真实版本号。
+         * 与上注时用同一个解析函数，这里解析不过的包，激活后也一定上注失败，
+         * 所以在入库前就拒掉。 */
+        firmware_metadata_t fw_meta;
+        if (firmware_parse_metadata(staging_dir, &fw_meta) != SUCCESS) {
+            LOG_ERROR("Invalid firmware package: failed to parse metadata.txt");
+            remove_tree(staging_dir);
+            result = DOWNLOAD_RESULT_EXTRACT;
+            goto send_result;
+        }
+
+        fpga_kind_t kind = firmware_fpga_kind(fw_meta.file_sub_type);
+        const char *kind_dir = firmware_fpga_kind_dir(kind);
+        if (kind_dir == NULL) {
+            LOG_ERROR("Unknown FPGA firmware sub type 0x%02X (expected 0x01/0x02=V7A, "
+                      "0x13/0x14=V7B, 0x11/0x12=subarray), package rejected",
+                      fw_meta.file_sub_type);
+            remove_tree(staging_dir);
+            result = DOWNLOAD_RESULT_OTHER;
+            goto send_result;
+        }
+
+        /* 【关键】fw_meta.version 来自压缩包内的 metadata.txt，随后被拼进目标路径并
+         * 交给 rm -rf / rename —— 二阶注入面（压缩包来自北向指定的下载路径）。
+         * 与入站处同样过 shell_safe_name，不通过就沿用受校验的临时版本号。 */
+        char real_version[MAX_VERSION_LEN];
+        if (fw_meta.version[0] != '\0' && shell_safe_name(fw_meta.version)) {
+            strncpy(real_version, fw_meta.version, sizeof(real_version) - 1);
+        } else {
+            if (fw_meta.version[0] != '\0') {
+                LOG_ERROR("SECURITY ALERT: unsafe version in package metadata, "
+                          "rejected: '%s' (keeping temp version '%s')",
+                          fw_meta.version, task->version);
+            }
+            strncpy(real_version, task->version, sizeof(real_version) - 1);
+        }
+        real_version[sizeof(real_version) - 1] = '\0';
+
+        char kind_base[256];
+        snprintf(kind_base, sizeof(kind_base), "%s/%s", FIRMWARE_BASE_DIR, kind_dir);
+        if (create_directory_recursive(kind_base) != SUCCESS) {
+            LOG_ERROR("Failed to create firmware directory: %s", kind_base);
+            remove_tree(staging_dir);
+            result = DOWNLOAD_RESULT_OTHER;
+            goto send_result;
+        }
+
+        snprintf(version_dir, sizeof(version_dir), "%s/%s", kind_base, real_version);
+
+        /* 只会替换【同一种 FPGA】的同版本旧包；其他 FPGA 与软件版本不受影响 */
+        struct stat st_check;
+        if (stat(version_dir, &st_check) == 0) {
+            LOG_WARN("%s firmware %s already exists, replacing it",
+                     firmware_fpga_kind_name(kind), real_version);
+            remove_tree(version_dir);
+        }
+
+        if (rename(staging_dir, version_dir) != 0) {
+            LOG_ERROR("Failed to move firmware from %s to %s: %s",
+                      staging_dir, version_dir, strerror(errno));
+            remove_tree(staging_dir);
+            result = DOWNLOAD_RESULT_OTHER;
+            goto send_result;
+        }
+
+        LOG_INFO("Firmware stored: FPGA=%s (sub_type=0x%02X), version=%s, dir=%s",
+                 firmware_fpga_kind_name(kind), fw_meta.file_sub_type,
+                 real_version, version_dir);
+
+        strncpy(task->version, real_version, sizeof(task->version) - 1);
+        task->version[sizeof(task->version) - 1] = '\0';
+        strncpy(metadata.version, real_version, sizeof(metadata.version) - 1);
     }
 
     /* 保存版本元数据 */
@@ -1000,7 +1091,7 @@ static void* version_download_thread_func(void *arg)
     metadata.ver_type = task->ver_type;
     snprintf(metadata.install_path, sizeof(metadata.install_path), "%s", version_dir);
 
-    if (save_version_metadata(&metadata) != SUCCESS) {
+    if (save_version_metadata(version_dir, &metadata) != SUCCESS) {
         LOG_ERROR("Failed to save version metadata");
         result = DOWNLOAD_RESULT_OTHER;
         goto send_result;
@@ -1069,8 +1160,123 @@ static int send_version_activate_ack(const cpri_msg_header_t *req_header,
     return (len > 0) ? SUCCESS : ERROR_GENERAL;
 }
 
-/* 切换到指定版本（原子操作） */
-static int switch_to_version(const char *version, const char *reason)
+/* ==================== 试运行记录读写 ====================
+ * 记录文件 VERSION_TRIAL_FILE，key=value 文本，同时被 scripts/upgrade-guard.sh 读写：
+ *   new=<新版本目录>        与 readlink(VERSION_CURRENT_LINK) 的原始结果逐字比较
+ *   previous=<上一个版本目录>
+ *   attempts=<已启动次数>   由 upgrade-guard.sh 每次启动前 +1，程序稳定运行后清零
+ *   time=<写入时间>
+ * 读写都在 g_trial_mutex 下进行（通道建立回调与主循环两个线程会调用）。 */
+typedef struct {
+    char new_dir[512];
+    char prev_dir[512];
+    uint32_t attempts;
+    char time[32];
+} version_trial_t;
+
+static pthread_mutex_t g_trial_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool g_trial_confirmed = false;      /* 本进程已确认过，不再重复处理 */
+static bool g_trial_stable_done = false;    /* 本进程已做过稳定运行清零 */
+static uint32_t g_trial_stable_sec = 120;   /* UPGRADE_TRIAL_STABLE_SEC */
+
+/* 读取 current 软链接的原始指向（不做 realpath，与 shell 侧 readlink 一致） */
+static int read_current_link(char *buf, size_t size)
+{
+    ssize_t len = readlink(VERSION_CURRENT_LINK, buf, size - 1);
+    if (len <= 0) {
+        buf[0] = '\0';
+        return ERROR_GENERAL;
+    }
+    buf[len] = '\0';
+    return SUCCESS;
+}
+
+static int trial_read(version_trial_t *t)
+{
+    memset(t, 0, sizeof(*t));
+    FILE *fp = fopen(VERSION_TRIAL_FILE, "r");
+    if (!fp) {
+        return ERROR_GENERAL;
+    }
+    char line[640];
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char *eq = strchr(line, '=');
+        if (!eq) {
+            continue;
+        }
+        *eq = '\0';
+        const char *key = line;
+        const char *val = eq + 1;
+        if (strcmp(key, "new") == 0) {
+            snprintf(t->new_dir, sizeof(t->new_dir), "%s", val);
+        } else if (strcmp(key, "previous") == 0) {
+            snprintf(t->prev_dir, sizeof(t->prev_dir), "%s", val);
+        } else if (strcmp(key, "attempts") == 0) {
+            t->attempts = (uint32_t)strtoul(val, NULL, 10);
+        } else if (strcmp(key, "time") == 0) {
+            snprintf(t->time, sizeof(t->time), "%s", val);
+        }
+    }
+    fclose(fp);
+    return (t->new_dir[0] != '\0') ? SUCCESS : ERROR_GENERAL;
+}
+
+/* 先写临时文件、fsync，再 rename 覆盖：任何时刻断电，记录要么是旧的要么是新的，
+ * 不会是写了一半的。 */
+static int trial_write(const version_trial_t *t)
+{
+    char tmp[sizeof(VERSION_TRIAL_FILE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", VERSION_TRIAL_FILE);
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) {
+        LOG_ERROR("Failed to write trial record %s: %s", tmp, strerror(errno));
+        return ERROR_GENERAL;
+    }
+    fprintf(fp, "new=%s\nprevious=%s\nattempts=%u\ntime=%s\n",
+            t->new_dir, t->prev_dir, t->attempts, t->time);
+    fflush(fp);
+    fsync(fileno(fp));
+    fclose(fp);
+    if (rename(tmp, VERSION_TRIAL_FILE) != 0) {
+        LOG_ERROR("Failed to commit trial record: %s", strerror(errno));
+        unlink(tmp);
+        return ERROR_GENERAL;
+    }
+    return SUCCESS;
+}
+
+static void trial_remove(void)
+{
+    if (unlink(VERSION_TRIAL_FILE) == 0) {
+        sync();
+    }
+}
+
+/* 原子地把 current 指向 target：先建临时软链接，再 rename 覆盖。
+ * 原实现是 unlink 后 symlink，两步之间断电会让 current 消失，服务再也起不来。 */
+static int replace_current_link(const char *target)
+{
+    char tmp_link[sizeof(VERSION_CURRENT_LINK) + 8];
+    snprintf(tmp_link, sizeof(tmp_link), "%s.tmp", VERSION_CURRENT_LINK);
+    unlink(tmp_link);
+    if (symlink(target, tmp_link) != 0) {
+        LOG_ERROR("Failed to create symlink %s -> %s: %s", tmp_link, target, strerror(errno));
+        return ERROR_GENERAL;
+    }
+    if (rename(tmp_link, VERSION_CURRENT_LINK) != 0) {
+        LOG_ERROR("Failed to replace %s: %s", VERSION_CURRENT_LINK, strerror(errno));
+        unlink(tmp_link);
+        return ERROR_GENERAL;
+    }
+    sync();
+    return SUCCESS;
+}
+
+/* 切换到指定版本（原子操作）
+ * trial=true：BBU 激活新版本，进入试运行（失败可被 upgrade-guard.sh 自动回退）；
+ * trial=false：人工回退等，直接切换，并结束任何进行中的试运行。 */
+static int switch_to_version(const char *version, const char *reason, bool trial)
 {
     char version_dir[512];
     char rollback_dir[512];
@@ -1096,17 +1302,16 @@ static int switch_to_version(const char *version, const char *reason)
 
     /* 检查版本元数据 */
     version_metadata_t metadata;
-    if (load_version_metadata(version, &metadata) != SUCCESS) {
+    if (load_version_metadata(version_dir, &metadata) != SUCCESS) {
         LOG_ERROR("Failed to load version metadata");
         return ACTIVATE_RESULT_CORRUPTED;
     }
 
-    /* 备份当前版本 */
-    char current_link[512];
-    snprintf(current_link, sizeof(current_link), "%s", VERSION_CURRENT_LINK);
+    /* 记录当前版本（回退的目标） */
+    char current_target[512] = {0};
+    read_current_link(current_target, sizeof(current_target));
 
-    if (lstat(current_link, &st) == 0 && S_ISLNK(st.st_mode)) {
-        /* 创建回滚目录 */
+    if (current_target[0] != '\0') {
         snprintf(rollback_dir, sizeof(rollback_dir), "%s/%s",
                 VERSION_ROLLBACK_DIR, timestamp);
         if (create_directory_recursive(rollback_dir) != SUCCESS) {
@@ -1114,36 +1319,59 @@ static int switch_to_version(const char *version, const char *reason)
             return ACTIVATE_RESULT_OTHER;
         }
 
-        /* 读取当前符号链接指向 */
-        char current_target[512];
-        ssize_t len = readlink(current_link, current_target, sizeof(current_target) - 1);
-        if (len > 0) {
-            current_target[len] = '\0';
-
-            /* 保存回滚信息 */
-            char rollback_info[1024];
-            snprintf(rollback_info, sizeof(rollback_info), "%s/rollback.json", rollback_dir);
-            FILE *fp = fopen(rollback_info, "w");
-            if (fp) {
-                fprintf(fp, "{\n");
-                fprintf(fp, "  \"timestamp\": \"%s\",\n", timestamp);
-                fprintf(fp, "  \"previous_version\": \"%s\",\n", current_target);
-                fprintf(fp, "  \"new_version\": \"%s\",\n", version);
-                fprintf(fp, "  \"reason\": \"%s\"\n", reason ? reason : "upgrade");
-                fprintf(fp, "}\n");
-                fclose(fp);
-            }
-
-            LOG_INFO("Backed up current version info to: %s", rollback_dir);
+        /* 保存切换记录（审计用） */
+        char rollback_info[1024];
+        snprintf(rollback_info, sizeof(rollback_info), "%s/rollback.json", rollback_dir);
+        FILE *fp = fopen(rollback_info, "w");
+        if (fp) {
+            fprintf(fp, "{\n");
+            fprintf(fp, "  \"timestamp\": \"%s\",\n", timestamp);
+            fprintf(fp, "  \"previous_version\": \"%s\",\n", current_target);
+            fprintf(fp, "  \"new_version\": \"%s\",\n", version);
+            fprintf(fp, "  \"reason\": \"%s\"\n", reason ? reason : "upgrade");
+            fprintf(fp, "}\n");
+            fclose(fp);
         }
+
+        LOG_INFO("Backed up current version info to: %s", rollback_dir);
     }
 
-    /* 删除旧的符号链接 */
-    unlink(current_link);
+    /* 试运行记录必须【先于】切换软链接写入：
+     *   - 若写完记录、切换前断电：记录的 new 与 current 不符，upgrade-guard.sh
+     *     会当作过期记录删掉，系统仍跑旧版本；
+     *   - 反过来先切换后写记录，两步之间断电，新版本就在没有保护的情况下运行。 */
+    struct stat prev_st;
+    bool same_version = (current_target[0] != '\0' && strcmp(current_target, version_dir) == 0);
+    pthread_mutex_lock(&g_trial_mutex);
+    if (trial && !same_version && current_target[0] != '\0' &&
+        stat(current_target, &prev_st) == 0 && S_ISDIR(prev_st.st_mode)) {
+        version_trial_t t;
+        memset(&t, 0, sizeof(t));
+        snprintf(t.new_dir, sizeof(t.new_dir), "%s", version_dir);
+        snprintf(t.prev_dir, sizeof(t.prev_dir), "%s", current_target);
+        t.attempts = 0;
+        snprintf(t.time, sizeof(t.time), "%s", timestamp);
+        if (trial_write(&t) == SUCCESS) {
+            LOG_INFO("Upgrade trial armed: %s (fallback: %s)", version_dir, current_target);
+        } else {
+            LOG_WARN("Failed to arm upgrade trial, new version will run without auto rollback");
+        }
+    } else if (!same_version) {
+        /* 人工回退、首次安装（无上一个版本可回）：不试运行，清掉残留记录。
+         * 重复激活当前版本（same_version）则保持现状，不打断进行中的试运行。 */
+        if (trial) {
+            LOG_WARN("No previous version to fall back to, %s will run without auto rollback",
+                     version_dir);
+        }
+        trial_remove();
+    }
+    pthread_mutex_unlock(&g_trial_mutex);
 
-    /* 创建新的符号链接 */
-    if (symlink(version_dir, current_link) != 0) {
-        LOG_ERROR("Failed to create symlink: %s -> %s", current_link, version_dir);
+    /* 原子切换软链接 */
+    if (replace_current_link(version_dir) != SUCCESS) {
+        pthread_mutex_lock(&g_trial_mutex);
+        trial_remove();     /* 没切成功，试运行记录作废 */
+        pthread_mutex_unlock(&g_trial_mutex);
         return ACTIVATE_RESULT_OTHER;
     }
 
@@ -1161,6 +1389,17 @@ int version_manager_init(void)
     create_directory_recursive(VERSION_BASE_DIR);
     create_directory_recursive(VERSION_ROLLBACK_DIR);
     create_directory_recursive(VERSION_DOWNLOAD_DIR);
+    create_directory_recursive(VERSION_DOWNLOAD_SW_DIR);
+    create_directory_recursive(VERSION_DOWNLOAD_FW_DIR);
+
+    /* 固件按 FPGA 种类分目录存放 */
+    create_directory_recursive(FIRMWARE_STAGING_DIR);
+    for (int k = FPGA_KIND_UNKNOWN + 1; k < FPGA_KIND_COUNT; k++) {
+        char kind_base[256];
+        snprintf(kind_base, sizeof(kind_base), "%s/%s",
+                 FIRMWARE_BASE_DIR, firmware_fpga_kind_dir((fpga_kind_t)k));
+        create_directory_recursive(kind_base);
+    }
 
     /* 读取当前版本 */
     char current_link[512];
@@ -1183,6 +1422,49 @@ int version_manager_init(void)
         LOG_WARN("No current version symlink found");
     }
 
+    /* ---- 试运行 / 自动回退状态 ---- */
+    int stable_sec = config_get_int("UPGRADE_TRIAL_STABLE_SEC", 120);
+    g_trial_stable_sec = (stable_sec > 0) ? (uint32_t)stable_sec : 120;
+
+    version_trial_t t;
+    if (trial_read(&t) == SUCCESS) {
+        char cur[512];
+        read_current_link(cur, sizeof(cur));
+        if (strcmp(cur, t.new_dir) != 0) {
+            /* 记录的不是当前运行的版本（如切换前断电、人工改过软链接），作废 */
+            LOG_WARN("Stale upgrade trial record (trial=%s, current=%s), removing",
+                     t.new_dir, cur);
+            trial_remove();
+        } else {
+            LOG_WARN("Running new version in TRIAL mode: start %u, fallback=%s. "
+                     "Will be confirmed when channel to BBU is established.",
+                     t.attempts, t.prev_dir);
+        }
+    }
+
+    /* 本次启动前 upgrade-guard.sh 做过自动回退：告警通知 BBU（TCP 连上后补报）。
+     * 通知文件保留到与 BBU 通道建立后再删，保证告警有机会送达。 */
+    FILE *nfp = fopen(VERSION_AUTO_ROLLBACK_NOTICE, "r");
+    if (nfp) {
+        char from[640] = {0}, to[640] = {0}, line[640];
+        while (fgets(line, sizeof(line), nfp)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strncmp(line, "from=", 5) == 0) {
+                snprintf(from, sizeof(from), "%s", line + 5);
+            } else if (strncmp(line, "to=", 3) == 0) {
+                snprintf(to, sizeof(to), "%s", line + 3);
+            }
+        }
+        fclose(nfp);
+        const char *from_v = strrchr(from, '/');
+        const char *to_v = strrchr(to, '/');
+        char info[80];
+        snprintf(info, sizeof(info), "auto rollback %s -> %s",
+                 from_v ? from_v + 1 : from, to_v ? to_v + 1 : to);
+        LOG_ERROR("Previous upgrade failed to start, system auto rolled back: %s -> %s", from, to);
+        alarm_trigger_version_activate_fail(info);
+    }
+
     g_download_task.in_progress = false;
     LOG_INFO("Version manager initialized");
     return SUCCESS;
@@ -1192,6 +1474,17 @@ int version_handle_download_request(const cpri_message_t *msg)
 {
     if (!msg || !msg->payload) {
         LOG_ERROR("Invalid version download request message");
+        return ERROR_INVALID_PARAM;
+    }
+
+    /* 长度门：payload 不足一个完整 IE 14 时直接丢弃。
+     * payload 来自固定 8192 字节的内存池槽位，不校验长度就强转结构体，读到的
+     * 是池里上一条报文的残留（旧的文件名/路径/版本号），可能据此发起一次
+     * 并非本次请求的下载。与 msg_handler.c 中其他 IE 的长度门保持一致。
+     * 注意必须放在"busy"分支之前：那里也会读 ie_req->ver_type。 */
+    if (msg->payload_len < sizeof(ie_version_download_req_t)) {
+        LOG_ERROR("Version download request payload too short: %u bytes (need %zu), dropped",
+                  msg->payload_len, sizeof(ie_version_download_req_t));
         return ERROR_INVALID_PARAM;
     }
 
@@ -1216,58 +1509,74 @@ int version_handle_download_request(const cpri_message_t *msg)
     /* 解析IE 14 */
     ie_version_download_req_t *ie_req = (ie_version_download_req_t *)msg->payload;
 
+    /* IE 14 里的字符串都是定长字段，协议不保证以 NUL 结尾（例如 file_name[16]
+     * 正好填满 16 字节）。直接对它们用 %s / strlen / strstr 会越过字段一路读到
+     * 后续字段乃至结构体之外。先拷成本地的、保证结尾 NUL 的副本，后面只用副本。 */
+    char req_file_ver[sizeof(ie_req->file_ver) + 1];
+    char req_file_name[sizeof(ie_req->file_name) + 1];
+    char req_file_path[sizeof(ie_req->file_path) + 1];
+    char req_file_time[sizeof(ie_req->file_time) + 1];
+    memcpy(req_file_ver,  ie_req->file_ver,  sizeof(ie_req->file_ver));
+    memcpy(req_file_name, ie_req->file_name, sizeof(ie_req->file_name));
+    memcpy(req_file_path, ie_req->file_path, sizeof(ie_req->file_path));
+    memcpy(req_file_time, ie_req->file_time, sizeof(ie_req->file_time));
+    req_file_ver[sizeof(ie_req->file_ver)]   = '\0';
+    req_file_name[sizeof(ie_req->file_name)] = '\0';
+    req_file_path[sizeof(ie_req->file_path)] = '\0';
+    req_file_time[sizeof(ie_req->file_time)] = '\0';
+
     LOG_INFO("Received version download request: version=%s, file=%s",
-            ie_req->file_ver, ie_req->file_name);
+            req_file_ver, req_file_name);
 
     /* 根据版本类型确定临时版本号 */
     if (ie_req->ver_type == VERSION_TYPE_SOFTWARE) {
         /* 软件版本：必须使用 BBU 提供的 file_ver 作为版本号 */
-        if (ie_req->file_ver[0] != '\0' && strlen(ie_req->file_ver) > 0) {
-            strncpy(g_download_task.version, ie_req->file_ver, sizeof(g_download_task.version) - 1);
+        if (req_file_ver[0] != '\0' && strlen(req_file_ver) > 0) {
+            strncpy(g_download_task.version, req_file_ver, sizeof(g_download_task.version) - 1);
             LOG_INFO("Software version from BBU: %s", g_download_task.version);
         } else {
             /* 如果 BBU 没有提供版本号，从文件名提取（兼容处理） */
-            const char *dot_pos = strstr(ie_req->file_name, ".tar.gz");
+            const char *dot_pos = strstr(req_file_name, ".tar.gz");
             if (dot_pos) {
-                size_t len = dot_pos - ie_req->file_name;
+                size_t len = dot_pos - req_file_name;
                 if (len < sizeof(g_download_task.version)) {
-                    strncpy(g_download_task.version, ie_req->file_name, len);
+                    strncpy(g_download_task.version, req_file_name, len);
                     g_download_task.version[len] = '\0';
                 } else {
-                    strncpy(g_download_task.version, ie_req->file_name, sizeof(g_download_task.version) - 1);
+                    strncpy(g_download_task.version, req_file_name, sizeof(g_download_task.version) - 1);
                 }
             } else {
-                strncpy(g_download_task.version, ie_req->file_name, sizeof(g_download_task.version) - 1);
+                strncpy(g_download_task.version, req_file_name, sizeof(g_download_task.version) - 1);
             }
             LOG_WARN("Software version not provided by BBU, extracted from filename: %s", g_download_task.version);
         }
     } else {
         /* 固件版本：使用临时版本号，真实版本号将从 metadata.txt 读取 */
-        if (ie_req->file_ver[0] != '\0' && strlen(ie_req->file_ver) > 0) {
-            strncpy(g_download_task.version, ie_req->file_ver, sizeof(g_download_task.version) - 1);
+        if (req_file_ver[0] != '\0' && strlen(req_file_ver) > 0) {
+            strncpy(g_download_task.version, req_file_ver, sizeof(g_download_task.version) - 1);
             LOG_INFO("Firmware temporary version: %s", g_download_task.version);
         } else {
             /* 从文件名提取临时版本号 */
-            const char *dot_pos = strstr(ie_req->file_name, ".tar.gz");
+            const char *dot_pos = strstr(req_file_name, ".tar.gz");
             if (dot_pos) {
-                size_t len = dot_pos - ie_req->file_name;
+                size_t len = dot_pos - req_file_name;
                 if (len < sizeof(g_download_task.version)) {
-                    strncpy(g_download_task.version, ie_req->file_name, len);
+                    strncpy(g_download_task.version, req_file_name, len);
                     g_download_task.version[len] = '\0';
                 } else {
-                    strncpy(g_download_task.version, ie_req->file_name, sizeof(g_download_task.version) - 1);
+                    strncpy(g_download_task.version, req_file_name, sizeof(g_download_task.version) - 1);
                 }
             } else {
-                strncpy(g_download_task.version, ie_req->file_name, sizeof(g_download_task.version) - 1);
+                strncpy(g_download_task.version, req_file_name, sizeof(g_download_task.version) - 1);
             }
             LOG_INFO("Firmware temporary version from filename: %s (will read real version from metadata.txt)",
                      g_download_task.version);
         }
     }
 
-    strncpy(g_download_task.file_path, ie_req->file_path, sizeof(g_download_task.file_path) - 1);
-    strncpy(g_download_task.file_name, ie_req->file_name, sizeof(g_download_task.file_name) - 1);
-    strncpy(g_download_task.file_time, ie_req->file_time, sizeof(g_download_task.file_time) - 1);
+    strncpy(g_download_task.file_path, req_file_path, sizeof(g_download_task.file_path) - 1);
+    strncpy(g_download_task.file_name, req_file_name, sizeof(g_download_task.file_name) - 1);
+    strncpy(g_download_task.file_time, req_file_time, sizeof(g_download_task.file_time) - 1);
     g_download_task.file_len = ie_req->file_len;
     g_download_task.ver_type = ie_req->ver_type;
 
@@ -1378,11 +1687,19 @@ int version_handle_activate_request(const cpri_message_t *msg)
         return ERROR_INVALID_PARAM;
     }
 
+    /* 长度门：同下载请求，不足一个完整 IE 311 时丢弃，避免读到池残留数据 */
+    if (msg->payload_len < sizeof(ie_version_activate_ind_t)) {
+        LOG_ERROR("Version activate request payload too short: %u bytes (need %zu), dropped",
+                  msg->payload_len, sizeof(ie_version_activate_ind_t));
+        return ERROR_INVALID_PARAM;
+    }
+
     /* 解析IE 311 */
     ie_version_activate_ind_t *ie_ind = (ie_version_activate_ind_t *)msg->payload;
 
-    LOG_INFO("Received version activate request: version=%s, type=%u",
-            ie_ind->version_num, ie_ind->ver_type);
+    /* version_num 是定长字段，不保证 NUL 结尾，用 %.*s 限定读取长度 */
+    LOG_INFO("Received version activate request: version=%.*s, type=%u",
+            (int)sizeof(ie_ind->version_num), ie_ind->version_num, ie_ind->ver_type);
 
     /* 处理版本号：去掉.tar.gz后缀（如果有） */
     char version[MAX_VERSION_LEN];
@@ -1409,42 +1726,50 @@ int version_handle_activate_request(const cpri_message_t *msg)
     }
 
     uint8_t result = ACTIVATE_RESULT_SUCCESS;
+    char fw_dir[512] = {0};     /* 固件激活时找到的实际目录，供后面上注使用 */
 
     /* 根据版本类型执行不同的激活逻辑 */
     if (ie_ind->ver_type == VERSION_TYPE_FIRMWARE) {
-        /* 固件版本：只验证版本是否存在，不修改软链接 */
+        /* 固件版本：只验证版本是否存在，不修改软链接。
+         * 固件按 FPGA 种类分目录存放（FIRMWARE_BASE_DIR/<种类>/<版本>），
+         * IE 311 不带种类，由 find_firmware_directory 在各种类目录中查找。 */
         LOG_INFO("Activating firmware version: %s (will not change current symlink)", version);
 
-        char version_dir[512];
-        /* 使用大小写不敏感查找 */
-        if (find_version_directory(version, version_dir, sizeof(version_dir)) == NULL) {
-            LOG_ERROR("Firmware version directory not found: %s", version);
+        fpga_kind_t kind = FPGA_KIND_UNKNOWN;
+        if (find_firmware_directory(version, fw_dir, sizeof(fw_dir), &kind) != SUCCESS) {
+            LOG_ERROR("Firmware version not found under %s/{v7a,v7b,subarray}: %s",
+                      FIRMWARE_BASE_DIR, version);
             result = ACTIVATE_RESULT_NOT_EXIST;
         } else {
-            /* 从实际目录路径中提取版本号 */
-            char *actual_version = strrchr(version_dir, '/');
-            if (actual_version) {
-                actual_version++;  /* 跳过 '/' */
-            } else {
-                actual_version = version;
-            }
+            /* 从实际目录路径中提取版本号（大小写可能与请求不同） */
+            const char *actual_version = strrchr(fw_dir, '/');
+            actual_version = actual_version ? actual_version + 1 : version;
 
-            /* 验证版本元数据 */
-            version_metadata_t metadata;
-            if (load_version_metadata(actual_version, &metadata) != SUCCESS) {
-                LOG_ERROR("Failed to load firmware version metadata");
+            /* 用上注时同一个解析函数校验，并核对包内子类型与所在目录一致，
+             * 防止目录被人为挪动/拷错后把一种 FPGA 的固件写进另一种 FPGA。 */
+            firmware_metadata_t fw_meta;
+            if (firmware_parse_metadata(fw_dir, &fw_meta) != SUCCESS) {
+                LOG_ERROR("Failed to parse firmware metadata in %s", fw_dir);
                 result = ACTIVATE_RESULT_CORRUPTED;
+            } else if (firmware_fpga_kind(fw_meta.file_sub_type) != kind) {
+                LOG_ERROR("Firmware sub_type 0x%02X (%s) does not match its directory %s (%s)",
+                          fw_meta.file_sub_type,
+                          firmware_fpga_kind_name(firmware_fpga_kind(fw_meta.file_sub_type)),
+                          fw_dir, firmware_fpga_kind_name(kind));
+                result = ACTIVATE_RESULT_MISMATCH;
             } else {
-                LOG_INFO("Firmware version validated: %s (actual: %s)", version, actual_version);
+                LOG_INFO("Firmware version validated: %s (actual: %s, FPGA=%s, dir=%s)",
+                         version, actual_version, firmware_fpga_kind_name(kind), fw_dir);
                 /* 更新 version 为实际版本号，用于后续的固件上注 */
                 strncpy(version, actual_version, sizeof(version) - 1);
+                version[sizeof(version) - 1] = '\0';
                 result = ACTIVATE_RESULT_SUCCESS;
             }
         }
     } else {
         /* 软件版本：执行版本切换（修改软链接） */
         LOG_INFO("Activating software version: %s (will update current symlink)", version);
-        result = switch_to_version(version, "BBU activate request");
+        result = switch_to_version(version, "BBU activate request", true);
     }
 
     /* 发送激活应答 */
@@ -1455,14 +1780,10 @@ int version_handle_activate_request(const cpri_message_t *msg)
 
         /* 如果是固件类型,触发FPGA固件上注 */
         if (ie_ind->ver_type == VERSION_TYPE_FIRMWARE) {
-            LOG_INFO("触发FPGA固件上注: %s", version);
+            LOG_INFO("触发FPGA固件上注: %s (%s)", version, fw_dir);
 
-            char version_dir[512];
-            snprintf(version_dir, sizeof(version_dir), "%s/%s",
-                    VERSION_BASE_DIR, version);
-
-            /* 启动后台上注任务 */
-            int ret = fpga_firmware_injection_start(version_dir, version);
+            /* 启动后台上注任务（目录为激活时查到的 FIRMWARE_BASE_DIR/<种类>/<版本>） */
+            int ret = fpga_firmware_injection_start(fw_dir, version);
             if (ret != SUCCESS) {
                 LOG_ERROR("启动FPGA固件上注失败");
                 /* 已发送激活成功应答,记录错误但继续 */
@@ -1472,13 +1793,9 @@ int version_handle_activate_request(const cpri_message_t *msg)
             LOG_INFO("Software version activated: %s", version);
             LOG_INFO("System will restart to apply new software version...");
 
-            /* 创建重启标记文件，供启动脚本检测 */
-            FILE *fp = fopen("/tmp/antenna_mgmt_restart_pending", "w");
-            if (fp) {
-                fprintf(fp, "version=%s\n", ie_ind->version_num);
-                fprintf(fp, "timestamp=%ld\n", time(NULL));
-                fclose(fp);
-            }
+            /* 原先这里会写 /tmp/antenna_mgmt_restart_pending，但没有任何程序读取它，
+             * 且服务配置了 PrivateTmp=true，写入的是服务私有 /tmp。已移除；
+             * 新版本能否起来由试运行机制（VERSION_TRIAL_FILE + upgrade-guard.sh）负责。 */
 
             /* 延迟 3 秒后重启服务（给 BBU 时间接收应答）。
              * 异步执行：不在此线程 sleep，也不经 shell（见 version_schedule_service_restart）。 */
@@ -1531,6 +1848,64 @@ int version_list_installed(char versions[][MAX_VERSION_LEN], int max_count)
     return count;
 }
 
+void version_trial_on_channel_established(void)
+{
+    pthread_mutex_lock(&g_trial_mutex);
+    if (g_trial_confirmed) {
+        pthread_mutex_unlock(&g_trial_mutex);
+        return;
+    }
+    g_trial_confirmed = true;
+
+    version_trial_t t;
+    if (trial_read(&t) == SUCCESS) {
+        char cur[512];
+        read_current_link(cur, sizeof(cur));
+        if (strcmp(cur, t.new_dir) == 0) {
+            LOG_INFO("Upgrade confirmed healthy (channel to BBU established): %s", t.new_dir);
+        } else {
+            LOG_WARN("Removing stale upgrade trial record (trial=%s, current=%s)", t.new_dir, cur);
+        }
+        trial_remove();
+    }
+
+    /* 自动回退告警已在 TCP 建链时补报，通道也建好了，通知文件完成使命 */
+    if (unlink(VERSION_AUTO_ROLLBACK_NOTICE) == 0) {
+        LOG_INFO("Auto rollback notice delivered, removed %s", VERSION_AUTO_ROLLBACK_NOTICE);
+    }
+    pthread_mutex_unlock(&g_trial_mutex);
+}
+
+void version_trial_on_uptime(uint32_t uptime_sec)
+{
+    if (uptime_sec < g_trial_stable_sec) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_trial_mutex);
+    if (g_trial_stable_done || g_trial_confirmed) {
+        pthread_mutex_unlock(&g_trial_mutex);
+        return;
+    }
+    g_trial_stable_done = true;
+
+    version_trial_t t;
+    if (trial_read(&t) == SUCCESS && t.attempts != 0) {
+        char cur[512];
+        read_current_link(cur, sizeof(cur));
+        if (strcmp(cur, t.new_dir) == 0) {
+            /* 能稳定运行这么久，说明不是"一启动就崩"。清零后，之后的断电/正常
+             * 重启不会被累计成启动失败；记录保留，等与 BBU 通道建立后再确认。 */
+            t.attempts = 0;
+            if (trial_write(&t) == SUCCESS) {
+                LOG_INFO("New version ran stable for %us, trial start counter reset "
+                         "(still waiting for BBU channel to confirm)", uptime_sec);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_trial_mutex);
+}
+
 int version_rollback(const char *version, const char *reason)
 {
     if (!version) {
@@ -1540,7 +1915,7 @@ int version_rollback(const char *version, const char *reason)
 
     LOG_INFO("Rolling back to version: %s, reason: %s", version, reason ? reason : "manual");
 
-    uint8_t result = switch_to_version(version, reason);
+    uint8_t result = switch_to_version(version, reason, false);
     if (result == ACTIVATE_RESULT_SUCCESS) {
         LOG_INFO("Rollback successful");
         return SUCCESS;

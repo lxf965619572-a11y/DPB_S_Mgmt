@@ -64,6 +64,7 @@ REQUIRED_FILES=(
     "$SCRIPT_DIR/antenna-mgmt.service"
     "$SCRIPT_DIR/antenna-mgmt-launcher.sh"
     "$SCRIPT_DIR/restart-after-activate.sh"
+    "$SCRIPT_DIR/upgrade-guard.sh"
 )
 
 for file in "${REQUIRED_FILES[@]}"; do
@@ -234,6 +235,7 @@ print_success "服务文件已安装"
 # 复制启动脚本
 cp "$SCRIPT_DIR/antenna-mgmt-launcher.sh" /opt/vendor/scripts/
 cp "$SCRIPT_DIR/restart-after-activate.sh" /opt/vendor/scripts/
+cp "$SCRIPT_DIR/upgrade-guard.sh" /opt/vendor/scripts/      # 升级试运行保护（service 的 ExecStartPre）
 chmod +x /opt/vendor/scripts/*.sh
 print_success "启动脚本已安装"
 

@@ -114,8 +114,11 @@ int fpga_firmware_injection_wait(uint32_t timeout_sec);
 
 /**
  * @brief 清理FPGA固件注入器
+ * @return SUCCESS: 注入线程已退出（或从未启动），资源已释放；
+ *         ERROR_TIMEOUT: 注入线程未在限时内退出，仍可能在使用 RS-422 串口与
+ *         协议层资源，调用方不得再关闭/释放它们。
  */
-void fpga_firmware_injection_cleanup(void);
+int fpga_firmware_injection_cleanup(void);
 
 /**
  * @brief 获取状态名称

@@ -12,6 +12,11 @@ Group=root
 # 工作目录指向当前版本
 WorkingDirectory=/opt/vendor/current
 
+# 升级试运行保护：每次启动前计数，新版本连续起不来时自动切回上一个版本。
+# "-" 前缀：脚本失败也不阻止启动（脚本本身也总是以 0 退出）。
+# 它在 ExecStart 之前执行，切换 current 后 ExecStart 才解析这个软链接。
+ExecStartPre=-/opt/vendor/scripts/upgrade-guard.sh
+
 # 通过符号链接启动程序
 ExecStart=/opt/vendor/current/antenna_mgmt /opt/vendor/config/antenna_mgmt.conf
 

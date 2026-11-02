@@ -10,6 +10,18 @@ static void* tcp_recv_thread(void *arg);
 static void* tcp_reconnect_thread(void *arg);
 static int tcp_connect_to_server(tcp_client_t *client);
 
+/* 可被 tcp_client_stop 打断的等待：按 100ms 切片睡眠，每片检查 running。
+ * 原先重连失败后直接 usleep(RECONNECT_INTERVAL_MS)，停止时最多要白等一整个
+ * 重连间隔（默认 3 秒）。 */
+static void tcp_interruptible_sleep_ms(tcp_client_t *client, uint32_t ms)
+{
+    while (client->running && ms > 0) {
+        uint32_t slice = (ms > 100) ? 100 : ms;
+        usleep(slice * 1000);
+        ms -= slice;
+    }
+}
+
 int tcp_client_init(tcp_client_t *client, const char *server_ip, uint16_t server_port)
 {
     if (!client || !server_ip) {
@@ -175,10 +187,10 @@ static void* tcp_reconnect_thread(void *arg)
         if (state == TCP_STATE_DISCONNECTED) {
             if (tcp_connect_to_server(client) != SUCCESS) {
                 LOG_WARN("Reconnect failed, retry after %d ms", g_config.reconnect_interval_ms);
-                usleep(g_config.reconnect_interval_ms * 1000);
+                tcp_interruptible_sleep_ms(client, (uint32_t)g_config.reconnect_interval_ms);
             }
         } else {
-            sleep(1);
+            tcp_interruptible_sleep_ms(client, 1000);
         }
     }
 
@@ -189,7 +201,7 @@ static void* tcp_recv_thread(void *arg)
 {
     tcp_client_t *client = (tcp_client_t*)arg;
     uint8_t buffer[8192];
-    int ret;
+    int ret = 0;    /* running 在线程启动前已被清掉时不进循环，日志仍要读它 */
 
     while (client->running) {
         ret = recv(client->sockfd, buffer, sizeof(buffer), 0);
@@ -308,7 +320,42 @@ int tcp_client_stop(tcp_client_t *client)
 
     client->running = false;
 
-    /* 先取 send_mutex 排空正在进行的 send，再关闭 fd */
+    /* 停止顺序（修复退出挂死）：
+     *
+     * 原实现是"close(fd) → join 接收线程"。但 Linux 上另一个线程 close() 一个
+     * 正阻塞在 recv() 里的 socket 并不会唤醒 recv；链路空闲（BBU 不发数据、
+     * 也不断链）时接收线程永远不返回，进程收到 SIGTERM 后卡死在 join，
+     * systemd 只能等超时后 SIGKILL。而且 fd 号被 close 释放后可能被别处复用，
+     * 接收线程醒来时会对一个不相干的 fd 调 recv。
+     *
+     * 现在：
+     *   1) 先 join 重连线程。它是唯一会创建接收线程的地方，先收掉它，后面
+     *      join 的 recv_thread 才不会被替换成一个新线程。它的等待均已改为
+     *      可打断（100ms 切片），最长受连接超时 5 秒约束。
+     *   2) 对 socket 做 shutdown(SHUT_RDWR)：这会让阻塞中的 recv() 立刻返回 0，
+     *      但 fd 本身不释放，避免 fd 号复用。
+     *   3) join 接收线程；它的退出段会在 state_mutex 下 close(fd) 并置 -1。
+     *   4) 兜底：若 fd 仍未关闭（如接收线程从未创建），在此关闭。 */
+    if (client->reconnect_thread) {
+        pthread_join(client->reconnect_thread, NULL);
+        client->reconnect_thread = 0;
+    }
+
+    /* 先取 send_mutex 排空正在进行的 send，再 shutdown（锁序 send -> state） */
+    pthread_mutex_lock(&client->send_mutex);
+    pthread_mutex_lock(&client->state_mutex);
+    if (client->sockfd >= 0) {
+        shutdown(client->sockfd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&client->state_mutex);
+    pthread_mutex_unlock(&client->send_mutex);
+
+    /* join 后清零 tid，避免对同一 tid 二次 join（UB） */
+    if (client->recv_thread) {
+        pthread_join(client->recv_thread, NULL);
+        client->recv_thread = 0;
+    }
+
     pthread_mutex_lock(&client->send_mutex);
     pthread_mutex_lock(&client->state_mutex);
     if (client->sockfd >= 0) {
@@ -318,16 +365,6 @@ int tcp_client_stop(tcp_client_t *client)
     client->state = TCP_STATE_DISCONNECTED;
     pthread_mutex_unlock(&client->state_mutex);
     pthread_mutex_unlock(&client->send_mutex);
-
-    /* 等待线程退出；join 后清零 tid，避免对同一 tid 二次 join（UB） */
-    if (client->recv_thread) {
-        pthread_join(client->recv_thread, NULL);
-        client->recv_thread = 0;
-    }
-    if (client->reconnect_thread) {
-        pthread_join(client->reconnect_thread, NULL);
-        client->reconnect_thread = 0;
-    }
 
     LOG_INFO("TCP client stopped");
     return SUCCESS;

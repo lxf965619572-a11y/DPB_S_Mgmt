@@ -47,6 +47,7 @@ set(SOURCES
     src/logger.c
     src/fpga_firmware_injector.c
     src/firmware_package.c
+    src/shell_util.c
 )
 
 # 查找OpenSSL

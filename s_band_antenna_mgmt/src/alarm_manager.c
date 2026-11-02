@@ -93,6 +93,16 @@ int alarm_manager_init(const alarm_config_t *config)
         g_alarm_config.over_temp_threshold_high = 85;
         g_alarm_config.over_temp_threshold_low = -40;
         g_alarm_config.link_grace_sec = 10;
+        g_alarm_config.optical_port_count = 4;
+    }
+
+    /* 只接受 4（仅主光口）或 8（主+备光口），其余一律按 4 处理，保持原有行为 */
+    if (g_alarm_config.optical_port_count != 4 && g_alarm_config.optical_port_count != 8) {
+        if (g_alarm_config.optical_port_count != 0) {
+            LOG_WARN("Invalid optical_port_count=%u, falling back to 4 (main ports only)",
+                     g_alarm_config.optical_port_count);
+        }
+        g_alarm_config.optical_port_count = 4;
     }
 
     if (pthread_mutex_init(&g_alarm_mgr.mutex, NULL) != 0) {
@@ -108,11 +118,12 @@ int alarm_manager_init(const alarm_config_t *config)
     g_optical_grace_armed = false;
     g_optical_grace_end = 0;
 
-    LOG_INFO("Alarm manager initialized (fault_threshold=%u, temp_high=%d, temp_low=%d, link_grace=%us)",
+    LOG_INFO("Alarm manager initialized (fault_threshold=%u, temp_high=%d, temp_low=%d, link_grace=%us, optical_ports=%u)",
              g_alarm_config.channel_fault_threshold,
              g_alarm_config.over_temp_threshold_high,
              g_alarm_config.over_temp_threshold_low,
-             g_alarm_config.link_grace_sec);
+             g_alarm_config.link_grace_sec,
+             g_alarm_config.optical_port_count);
     return SUCCESS;
 }
 
@@ -227,9 +238,14 @@ int alarm_trigger(uint32_t alarm_code, uint32_t sub_code, const char *additional
     if (tcp_connected) {
         alarm_report_to_bbu(alarm_code, sub_code, ALARM_CLEAR_FLAG_ACTIVE, additional_info);
 
+        /* 上报期间已解锁，槽位可能已被 alarm_clear 清掉、甚至被另一条告警复用；
+         * 只有确认还是同一条活跃告警时才置 reported，否则会把别的告警误标为已上报。 */
         pthread_mutex_lock(&g_alarm_mgr.mutex);
         if (record_idx >= 0 && record_idx < MAX_ALARM_RECORDS) {
-            g_alarm_mgr.records[record_idx].reported = true;
+            alarm_record_t *r = &g_alarm_mgr.records[record_idx];
+            if (r->active && r->alarm_code == alarm_code && r->sub_code == sub_code) {
+                r->reported = true;
+            }
         }
         pthread_mutex_unlock(&g_alarm_mgr.mutex);
     } else {
@@ -388,16 +404,26 @@ int alarm_report_all_pending(void)
         alarm_record_t *record = &g_alarm_mgr.records[i];
 
         if (record->active && !record->reported) {
-            /* 上报激活的告警 */
+            /* 解锁期间（上报要走 TCP 发送）其他线程可能 alarm_clear 掉这条记录、
+             * 或 alarm_trigger 复用该槽位写入新告警。因此：
+             *   - 解锁前把要用的字段拷到栈上，上报只用副本；
+             *   - 回锁后确认槽位仍是同一条活跃告警，才置 reported。 */
+            uint32_t code = record->alarm_code;
+            uint32_t sub  = record->sub_code;
+            char info[sizeof(record->additional_info)];
+            memcpy(info, record->additional_info, sizeof(info));
+            info[sizeof(info) - 1] = '\0';
+
             pthread_mutex_unlock(&g_alarm_mgr.mutex);
 
-            int ret = alarm_report_to_bbu(record->alarm_code, record->sub_code,
-                                          ALARM_CLEAR_FLAG_ACTIVE, record->additional_info);
+            int ret = alarm_report_to_bbu(code, sub, ALARM_CLEAR_FLAG_ACTIVE, info);
 
             pthread_mutex_lock(&g_alarm_mgr.mutex);
 
             if (ret == SUCCESS) {
-                record->reported = true;
+                if (record->active && record->alarm_code == code && record->sub_code == sub) {
+                    record->reported = true;
+                }
                 count++;
             }
         }
@@ -625,12 +651,18 @@ void alarm_periodic_check(const fpga_status_frame_t *fpga_status)
      * 宽限期内不调用 alarm_check_optical_sync_loss，也就不会更新状态跟踪器，
      * 所以到期仍未建链时会在到期后第一帧正常报出(只延迟，不吞掉)。 */
     if (!alarm_optical_in_grace()) {
+        /* link_success_flag: Bit0-3 主光口, Bit4-7 备光口（见 fpga_protocol.h），
+         * 子码 4-7 对应备路。备光口是否装配取决于硬件，未装配时其位恒为 0，
+         * 若无条件监测会常驻 4 条误报，故由配置 ALARM_OPTICAL_PORTS 决定：
+         * 4（默认，与原行为一致）只监测主光口，8 同时监测备光口。 */
         for (int i = 0; i < 4; i++) {
             bool main_sync = (fpga_status->data.link_success_flag & (1 << i)) != 0;
             alarm_check_optical_sync_loss(i, main_sync);
 
-            // bool backup_sync = (fpga_status->data.link_success_flag & (1 << (i + 4))) != 0;
-            // alarm_check_optical_sync_loss(i + 4, backup_sync);
+            if (g_alarm_config.optical_port_count == 8) {
+                bool backup_sync = (fpga_status->data.link_success_flag & (1 << (i + 4))) != 0;
+                alarm_check_optical_sync_loss(i + 4, backup_sync);
+            }
         }
     }
 }

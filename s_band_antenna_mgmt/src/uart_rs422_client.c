@@ -219,7 +219,7 @@ int uart_rs422_open(uart_rs422_client_t *client)
     options.c_oflag &= ~OPOST;          /* 原始输出 */
 
     /* 设置超时 */
-    options.c_cc[VTIME] = 0.1;            /* 使用select()超时 */
+    options.c_cc[VTIME] = 0;              /* 不用 termios 超时（cc_t 是整数，原写 0.1 实际也是 0），由 select() 控制超时 */
     options.c_cc[VMIN] = 1;
 
     /* 应用配置 */

@@ -412,7 +412,16 @@ int uart_client_send(uart_client_t *client, const uint8_t *data, uint32_t len)
     while (sent < len) {
         ssize_t ret = write(client->fd, data + sent, len - sent);
         if (ret < 0) {
+            if (errno == EINTR) {
+                continue;   /* 被信号打断，重写剩余部分 */
+            }
             LOG_ERROR("UART write error: %s", strerror(errno));
+            pthread_mutex_unlock(&client->send_mutex);
+            return ERROR_GENERAL;
+        }
+        if (ret == 0) {
+            /* 无进展：若继续循环会持 send_mutex 空转，把所有发送方一起卡死 */
+            LOG_ERROR("UART write made no progress (sent=%u/%u)", sent, len);
             pthread_mutex_unlock(&client->send_mutex);
             return ERROR_GENERAL;
         }

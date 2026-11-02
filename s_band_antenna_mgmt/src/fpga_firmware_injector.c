@@ -142,7 +142,7 @@ int fpga_firmware_injection_wait(uint32_t timeout_sec)
     }
 }
 
-void fpga_firmware_injection_cleanup(void)
+int fpga_firmware_injection_cleanup(void)
 {
     /* 改造前的问题：请求 abort 后只 sleep(2) 就无条件
      *   fclose(g_injection_task.bin_fp);  pthread_mutex_destroy(&state_mutex);
@@ -179,7 +179,8 @@ void fpga_firmware_injection_cleanup(void)
         if (!exited) {
             LOG_WARN("注入线程未在 3 秒内退出，跳过 mutex 销毁以避免 use-after-free"
                      "（进程即将退出）");
-            return;
+            /* 告知调用方：线程仍可能在用 RS-422 串口与协议层，不要再拆它们 */
+            return ERROR_TIMEOUT;
         }
 
         pthread_join(g_injection_task.injection_thread, NULL);
@@ -190,6 +191,7 @@ void fpga_firmware_injection_cleanup(void)
      * 这里不再重复 fclose，避免与线程竞态。 */
     pthread_mutex_destroy(&g_injection_task.state_mutex);
     LOG_INFO("FPGA固件注入器已清理");
+    return SUCCESS;
 }
 
 const char* fpga_injection_get_state_name(fpga_injection_state_t state)

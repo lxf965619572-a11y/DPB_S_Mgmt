@@ -32,7 +32,9 @@
 tcp_client_t g_tcp_client;  /* 全局TCP客户端，供msg_handler使用 */
 uart_client_t g_uart_client;  /* 全局UART客户端，供fpga_handler使用 */
 uart_rs422_client_t g_uart_rs422_client;  /* RS-422 UART客户端(用于FPGA固件上注) */
-static volatile bool g_running = true;
+/* 由信号处理器写，必须是 volatile sig_atomic_t 才保证读写原子、不被优化掉 */
+static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_exit_signal = 0;   /* 触发退出的信号号，主循环外再打日志 */
 static volatile bool g_channel_established = false;  /* 通道建立标志 */
 uint32_t g_serial_num = 0;  /* PAAU侧流水号 */
 pthread_mutex_t g_serial_num_mutex = PTHREAD_MUTEX_INITIALIZER;  /* 保护流水号（全局） */
@@ -52,11 +54,13 @@ static inline uint32_t get_next_serial_num(void)
 static void signal_handler(int signo)
 {
     if (signo == SIGINT || signo == SIGTERM) {
-        /* 必须先置退出标志：LOG_* 会取 g_log_mutex 并做文件 I/O，
-         * 在信号处理器中属 async-signal-unsafe，可能自死锁。
-         * 先置标志可保证即使 LOG 卡住，主循环与其他线程仍能正常退出。 */
-        g_running = false;
-        LOG_INFO("Received signal %d, shutting down...", signo);
+        /* 信号处理器里只做 async-signal-safe 的事：置标志。
+         * 原先这里还调用 LOG_INFO —— 它会取 g_log_mutex 并做 stdio 文件 I/O，
+         * 若信号恰好打断了一个正持有 g_log_mutex 的线程（主线程自己也在打日志），
+         * 就会在同一线程上二次加锁而永久自死锁，进程既不退出也不再工作。
+         * 日志移到主循环结束后打印。 */
+        g_exit_signal = signo;
+        g_running = 0;
     }
 }
 
@@ -95,6 +99,14 @@ static void on_tcp_connected(void)
 static void on_tcp_disconnected(void)
 {
     LOG_WARN("TCP disconnected from BBU");
+    /* 丢弃上一条连接残留的半帧。
+     * 断链时缓冲里可能还有不完整的报文（1~8191 字节），若不清掉，重连后新连接
+     * 的首批字节会被拼接到这段残留后面，按错位的长度字段去解析，轻则丢掉
+     * 新连接的首条报文（通道建立配置），重则把拼出来的垃圾当成合法报文分发。
+     * 线程安全：本回调在接收线程的退出段执行，与 on_tcp_data_received 是同一
+     * 线程；下一个接收线程要等本线程被 join 之后才会创建（见 tcp_connect_to_server），
+     * 因此这里无需加锁。 */
+    g_recv_offset = 0;
     /* 重置通道建立标志 */
     g_channel_established = false;
     /* 停止心跳 */
@@ -154,6 +166,8 @@ static void on_tcp_data_received(const uint8_t *data, uint32_t len)
                 /* 基带通道重新建立，放开"允许开发射"的闸门。
                  * 此处不直接开射：实际开射仍等基带重新下发频点配置。 */
                 cell_config_notify_bbu_link(true, "channel established with BBU");
+                /* 与 BBU 通道建立 = 当前软件版本可用：结束升级试运行（若有） */
+                version_trial_on_channel_established();
             }
 
             /* 分发消息处理 */
@@ -262,7 +276,9 @@ int main(int argc, char *argv[])
         /* 光链路告警启动宽限期：上电后 CPRI 光链路还在协商，这段时间
          * link_success_flag 本来就读 0，不设宽限会把正常建链过程报成
          * 4 条 1097 告警。从第一帧 FPGA 遥测起算，0=关闭。 */
-        .link_grace_sec = config_get_uint32("ALARM_LINK_GRACE_SEC", 10)
+        .link_grace_sec = config_get_uint32("ALARM_LINK_GRACE_SEC", 10),
+        /* 1097 监测光口数：4=仅主光口（默认），8=主+备光口。按硬件装配情况配置 */
+        .optical_port_count = (uint8_t)config_get_uint32("ALARM_OPTICAL_PORTS", 4)
     };
     ret = alarm_manager_init(&alarm_config);
     if (ret != SUCCESS) {
@@ -459,10 +475,14 @@ int main(int argc, char *argv[])
     /* 主循环 */
     int channel_setup_timer = 0;
     int heartbeat_timer = 0;
+    uint32_t uptime_sec = 0;
     while (g_running) {
         sleep(1);
         channel_setup_timer++;
         heartbeat_timer++;
+
+        /* 升级试运行：稳定运行达到 UPGRADE_TRIAL_STABLE_SEC 后清零启动计数 */
+        version_trial_on_uptime(++uptime_sec);
 
         /* 如果通道未建立且TCP已连接，每5秒发送一次通道建立请求 */
         if (!g_channel_established && tcp_client_get_state(&g_tcp_client) == TCP_STATE_CONNECTED) {
@@ -514,17 +534,26 @@ int main(int argc, char *argv[])
     }
 
 cleanup:
+    if (g_exit_signal != 0) {
+        LOG_INFO("Received signal %d, shutting down...", (int)g_exit_signal);
+    }
     LOG_INFO("Shutting down...");
 
     /* 停止FPGA看门狗 */
     fpga_watchdog_stop();
     fpga_watchdog_destroy();
 
-    /* 清理FPGA固件上注模块 */
-    fpga_firmware_injection_cleanup();
-    uart_rs422_close(&g_uart_rs422_client);
-    firmware_package_cleanup();
-    rs422_protocol_cleanup();
+    /* 清理FPGA固件上注模块。
+     * 注入线程若未能在限时内退出（卡在 RS-422 收发里），它仍在使用串口 fd 与
+     * RS-422 协议层资源；此时再 close 串口 / cleanup 协议层就是 use-after-free。
+     * 进程马上就要退出，这些资源交给内核回收即可。 */
+    if (fpga_firmware_injection_cleanup() == SUCCESS) {
+        uart_rs422_close(&g_uart_rs422_client);
+        firmware_package_cleanup();
+        rs422_protocol_cleanup();
+    } else {
+        LOG_WARN("FPGA injection thread still alive, leaving RS-422 resources to process exit");
+    }
 
     heartbeat_stop();
 

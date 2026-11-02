@@ -231,7 +231,7 @@ int fpga_decode_status_frame(const uint8_t *buffer, uint32_t buffer_len, fpga_st
     status->data.supported_modes = NTOHS(status->data.supported_modes);
     status->data.hw_version = NTOHL(status->data.hw_version);
     status->data.current_output_power = NTOHS(status->data.current_output_power);
-    status->data.reserved1 = NTOHS(status->data.reserved1);
+    /* reserved1 是 uint8_t，单字节无字节序可言（原先对它做 NTOHS 会把值截成 0） */
     status->data.beam_status = NTOHL(status->data.beam_status);
     status->data.lo_frequency = NTOHL(status->data.lo_frequency);
     status->data.lo_lock_status = NTOHL(status->data.lo_lock_status);
